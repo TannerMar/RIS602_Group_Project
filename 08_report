@@ -62,7 +62,9 @@ gather_context() {
 
     # Count hosts from recon data
     LIVE_HOSTS=0
-    [[ -f "$OUTDIR/hosts/targets.txt" ]] && LIVE_HOSTS=$(wc -l < "$OUTDIR/hosts/targets.txt")
+    [[ -f "$OUTDIR/hosts/all-live-hosts.txt" ]] && LIVE_HOSTS=$(wc -l < "$OUTDIR/hosts/all-live-hosts.txt")
+    WINDOWS_HOSTS=0
+    [[ -f "$OUTDIR/hosts/targets.txt" ]] && WINDOWS_HOSTS=$(wc -l < "$OUTDIR/hosts/targets.txt")
     COMPROMISED_HOSTS=0
     [[ -f "$CREDS_FILE" ]] && COMPROMISED_HOSTS=$(wc -l < "$CREDS_FILE")
 

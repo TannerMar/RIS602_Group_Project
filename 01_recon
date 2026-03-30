@@ -1,19 +1,13 @@
 #!/usr/bin/env bash
 
 # 01_recon — Network Reconnaissance
-#
-# Performs a proper four-phase recon:
+
+# Performs a proper five-phase recon:
 #   Phase 1: Host discovery (ping sweep)
 #   Phase 2: Full TCP port scan on all live hosts
 #   Phase 3: Service/version detection on all open ports (banner grabbing)
-#   Phase 4: Banner analysis to identify MSSQL servers
-
-# Outputs:
-#   recon/hosts/targets.txt          — live host IPs (one per line)
-#   recon/hosts/all-open-ports.txt   — IP:PORT pairs for every open port
-#   recon/services/full-service.gnmap — full service scan results
-#   recon/hosts/mssql-targets.txt    — IP:PORT pairs for confirmed MSSQL
-#   recon/scope.txt                  — the CIDR that was scanned
+#   Phase 4: Filter to Windows-only hosts (based on service signatures)
+#   Phase 5: Banner analysis to identify MSSQL servers
 
 CIDR="$1"
 
@@ -25,6 +19,7 @@ fi
 OUTDIR="./recon"
 mkdir -p "$OUTDIR/hosts" "$OUTDIR/services"
 
+ALL_HOSTS_FILE="$OUTDIR/hosts/all-live-hosts.txt"
 TARGETS_FILE="$OUTDIR/hosts/targets.txt"
 ALL_PORTS_FILE="$OUTDIR/hosts/all-open-ports.txt"
 MSSQL_FILE="$OUTDIR/hosts/mssql-targets.txt"
@@ -42,11 +37,11 @@ echo "[*] Phase 1: Host discovery (ping sweep)..."
 nmap -n -sn "$CIDR" --min-rate 10000 \
     -oG "$OUTDIR/hosts/ping-sweep.gnmap" > /dev/null
 
-grep "Up$" "$OUTDIR/hosts/ping-sweep.gnmap" | awk '{print $2}' > "$TARGETS_FILE"
+grep "Up$" "$OUTDIR/hosts/ping-sweep.gnmap" | awk '{print $2}' > "$ALL_HOSTS_FILE"
 
-LIVE_COUNT=$(wc -l < "$TARGETS_FILE")
+LIVE_COUNT=$(wc -l < "$ALL_HOSTS_FILE")
 echo "[+] Found $LIVE_COUNT live host(s)"
-cat "$TARGETS_FILE" | sed 's/^/    /'
+cat "$ALL_HOSTS_FILE" | sed 's/^/    /'
 echo ""
 
 if [[ $LIVE_COUNT -eq 0 ]]; then
@@ -55,10 +50,10 @@ if [[ $LIVE_COUNT -eq 0 ]]; then
 fi
 
 
-# Phase 2: Full TCP Port Scan
+# Phase 2: Full TCP Port Scan (all hosts, all OS types)
 
 echo "[*] Phase 2: Full TCP port scan on all live hosts..."
-nmap -Pn -n -p- -iL "$TARGETS_FILE" --min-rate 10000 \
+nmap -Pn -n -p- -iL "$ALL_HOSTS_FILE" --min-rate 10000 \
     -oG "$OUTDIR/services/full-port-sweep.gnmap" > /dev/null
 
 # Parse all open ports into IP:PORT pairs
@@ -89,7 +84,7 @@ UNIQUE_PORTS=$(cut -d: -f2 "$ALL_PORTS_FILE" | sort -un | paste -sd, -)
 
 nmap -Pn -n -sV --version-intensity 5 \
     -p "$UNIQUE_PORTS" \
-    -iL "$TARGETS_FILE" \
+    -iL "$ALL_HOSTS_FILE" \
     -oG "$OUTDIR/services/full-service.gnmap" \
     -oN "$OUTDIR/services/full-service.nmap" > /dev/null
 
@@ -99,9 +94,48 @@ echo "    $OUTDIR/services/full-service.nmap"
 echo ""
 
 
-# Phase 4: Identify MSSQL Servers from Banner/Service Data
+# Phase 4: Filter to Windows Hosts Only
 
-echo "[*] Phase 4: Identifying MSSQL servers from service banners..."
+# Parse the service scan results for Windows indicators:
+#   - microsoft-ds (SMB on 445)
+#   - netbios-ssn (NetBIOS on 139)
+#   - ms-wbt-server (RDP on 3389)
+#   - ms-sql (MSSQL)
+#   - Microsoft Windows in any version string
+
+echo "[*] Phase 4: Filtering for Windows hosts..."
+> "$TARGETS_FILE"
+
+if [[ -f "$OUTDIR/services/full-service.nmap" ]]; then
+    CURRENT_HOST=""
+    declare -A WINDOWS_HOSTS
+    while IFS= read -r LINE; do
+        if echo "$LINE" | grep -qP '^Nmap scan report for'; then
+            CURRENT_HOST=$(echo "$LINE" | grep -oP '[\d]+\.[\d]+\.[\d]+\.[\d]+')
+        fi
+        if [[ -n "$CURRENT_HOST" ]] && echo "$LINE" | grep -qiP 'microsoft-ds|netbios-ssn|ms-wbt-server|ms-sql|Microsoft Windows'; then
+            if [[ -z "${WINDOWS_HOSTS[$CURRENT_HOST]+exists}" ]]; then
+                echo "$CURRENT_HOST" >> "$TARGETS_FILE"
+                WINDOWS_HOSTS["$CURRENT_HOST"]=1
+            fi
+        fi
+    done < "$OUTDIR/services/full-service.nmap"
+fi
+
+WIN_COUNT=$(wc -l < "$TARGETS_FILE")
+echo "[+] $WIN_COUNT Windows host(s) identified"
+cat "$TARGETS_FILE" | sed 's/^/    /'
+echo ""
+
+if [[ $WIN_COUNT -eq 0 ]]; then
+    echo "[-] No Windows hosts found. PtH will have no targets."
+    echo "[-] Continuing to check for MSSQL..."
+fi
+
+
+# Phase 5: Identify MSSQL Servers from Banner/Service Data
+
+echo "[*] Phase 5: Identifying MSSQL servers from service banners..."
 > "$MSSQL_FILE"
 
 # Search for ms-sql, mssql, Microsoft SQL Server in the gnmap output
@@ -115,15 +149,12 @@ grep -i "ms-sql\|mssql\|microsoft sql\|ms-sql-s" "$OUTDIR/services/full-service.
 done
 
 # Fallback: also parse the normal-format nmap output for better matching
-# The gnmap format can be tricky; the .nmap output is more readable
 if [[ -f "$OUTDIR/services/full-service.nmap" ]]; then
     CURRENT_HOST=""
     while IFS= read -r LINE; do
-        # Capture the host IP from "Nmap scan report for X.X.X.X"
         if echo "$LINE" | grep -qP '^Nmap scan report for'; then
             CURRENT_HOST=$(echo "$LINE" | grep -oP '[\d]+\.[\d]+\.[\d]+\.[\d]+')
         fi
-        # Match lines like "1433/tcp open  ms-sql-s ..."
         if echo "$LINE" | grep -qiP '^\d+/tcp\s+open\s+.*ms-sql|^\d+/tcp\s+open\s+.*mssql|^\d+/tcp\s+open\s+.*microsoft sql'; then
             PORT=$(echo "$LINE" | grep -oP '^\d+')
             if [[ -n "$CURRENT_HOST" && -n "$PORT" ]]; then
