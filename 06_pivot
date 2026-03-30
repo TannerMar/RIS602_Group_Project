@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 
 # 06_pivot — Lateral Movement, Network Discovery, and Cross-Segment Pivoting
-
+#
 # This script performs cyclical lateral movement with real cross-network
 # pivoting using netsh portproxy on dual-homed compromised hosts:
-
+#
 #   1. Check all compromised hosts for additional network interfaces
 #   2. Pass-the-Hash using NTLM hashes from 04_hashdump
 #   3. When PtH succeeds: hashdump, check for new NICs, pivot recursively
@@ -40,7 +40,8 @@ PROXY_BASE_PORT=33000
 
 # Wordlists for brute-forcing new segments (same as 02_bruteforce)
 
-# CONFIGURABLE WORDLISTS 
+# CONFIGURABLE WORDLISTS — Same as in 02_bruteforce.
+
 USERS_FILE="/usr/share/wordlists/metasploit/common_users.txt"
 PASS_FILE="/usr/share/wordlists/metasploit/common_passwords.txt"
 
@@ -187,6 +188,12 @@ parse_networks_from_ipconfig() {
 
                 # Skip loopback, link-local, APIPA
                 if [[ "$CURRENT_IP" == 127.* || "$CURRENT_IP" == 169.254.* ]]; then
+                    CURRENT_IP=""
+                    continue
+                fi
+
+                # Skip invalid CIDR (bad mask parse = /0, host route = /32)
+                if [[ $CIDR_BITS -le 0 || $CIDR_BITS -ge 32 ]]; then
                     CURRENT_IP=""
                     continue
                 fi

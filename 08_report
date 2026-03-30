@@ -33,9 +33,9 @@ DATE_LABEL=$(date +"%Y-%m-%d")
 MD_FILE="/tmp/pentest_report_${DATE_LABEL}.md"
 PDF_FILE="./pentest_report_${DATE_LABEL}.pdf"
 
---
+#--
 # Gather engagement context (auto-detect where possible)
---
+#--
 gather_context() {
     echo "[*] Report context -- press Enter to accept defaults"
     echo ""
@@ -74,8 +74,8 @@ gather_context() {
     # Detect domains from recon output
     DOMAINS=""
     if [[ -d "$MSSQL_DIR" ]]; then
-        DOMAINS=$(grep -rhi "Primary Dns Suffix\|Domain\b.*:" "$MSSQL_DIR"/ "$PIVOT_DIR"/ 2>/dev/null | \
-            grep -oP ':\s*\K\S+\.\S+' | sort -u | paste -sd", " - 2>/dev/null || true)
+        DOMAINS=$(grep -rhi "Primary Dns Suffix" "$MSSQL_DIR"/ "$PIVOT_DIR"/ 2>/dev/null | \
+            grep -oP ':\s*\K[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}' | sort -u | paste -sd", " - 2>/dev/null || true)
     fi
 
     # Detect new network segments
@@ -101,9 +101,9 @@ gather_context() {
     echo ""
 }
 
---
+#--
 # Dependency check
---
+#--
 check_deps() {
     local MISSING=0
     if ! command -v pandoc &> /dev/null; then
@@ -121,14 +121,14 @@ check_deps() {
     fi
 }
 
---
+#--
 # Build the Markdown report
---
+#--
 build_report() {
 
-    ==
+#    ==
     # FRONT MATTER
-    ==
+#    ==
     cat > "$MD_FILE" <<EOF
 ---
 title: "Internal Network Penetration Test Report"
@@ -141,22 +141,22 @@ toc: true
 toc-depth: 3
 numbersections: true
 header-includes:
-  - \\\\usepackage{fancyhdr}
-  - \\\\pagestyle{fancy}
-  - \\\\fancyhead[L]{Pentest Report -- $CLIENT_NAME}
-  - \\\\fancyhead[R]{$DATE_LABEL}
-  - \\\\fancyfoot[C]{CONFIDENTIAL}
-  - \\\\usepackage{longtable}
-  - \\\\usepackage{booktabs}
-  - \\\\let\\\\OldTOC\\\\tableofcontents
-  - \\\\renewcommand{\\\\tableofcontents}{\\\\newpage\\\\OldTOC\\\\newpage}
+  - \\usepackage{fancyhdr}
+  - \\pagestyle{fancy}
+  - \\fancyhead[L]{Pentest Report -- $CLIENT_NAME}
+  - \\fancyhead[R]{$DATE_LABEL}
+  - \\fancyfoot[C]{CONFIDENTIAL}
+  - \\usepackage{longtable}
+  - \\usepackage{booktabs}
+  - \\let\\OldTOC\\tableofcontents
+  - \\renewcommand{\\tableofcontents}{\\newpage\\OldTOC\\newpage}
 ---
 
 EOF
 
-    ==
+#    ==
     # 1. EXECUTIVE SUMMARY
-    ==
+#    ==
     cat >> "$MD_FILE" <<EOF
 
 # Executive Summary
@@ -194,9 +194,9 @@ The findings demonstrate significant risk in the areas of authentication (weak/d
 
 EOF
 
-    ==
+#    ==
     # 2. ENGAGEMENT METHODOLOGY
-    ==
+#    ==
     cat >> "$MD_FILE" <<EOF
 
 # Engagement Methodology
@@ -219,9 +219,9 @@ The engagement followed a four-phase methodology consistent with industry-standa
 
 EOF
 
-    ==
+#    ==
     # 3. ATTACK NARRATIVE
-    ==
+#    ==
     cat >> "$MD_FILE" <<EOF
 
 # Attack Narrative
@@ -275,9 +275,9 @@ Upon completion of all testing activities, the cleanup phase was executed. All r
 
 EOF
 
-    ==
+#    ==
     # 4. TECHNICAL OBSERVATIONS (FINDINGS)
-    ==
+#    ==
     cat >> "$MD_FILE" <<EOF
 
 # Technical Observations
@@ -410,7 +410,7 @@ EOF
 | **Severity** | High |
 | **MITRE ATT&CK** | T1053.005 -- Scheduled Task/Job: Scheduled Task |
 
-**Observation:** A scheduled task ("$TASK_NAME") was created on compromised hosts, configured to execute a PowerShell reverse shell payload on system boot under the SYSTEM account. The payload was written to disk at c:\\windows\\temp\\healthcheck.ps1.
+**Observation:** A scheduled task ("$TASK_NAME") was created on compromised hosts, configured to execute a PowerShell reverse shell payload on system boot under the SYSTEM account. The payload was written to disk at \`c:\\windows\\temp\\healthcheck.ps1\`.
 
 **Impact:** This persistence mechanism allows an attacker to regain access to compromised systems even after a reboot. The use of a SYSTEM-level scheduled task ensures the payload runs with the highest privileges, and the innocuous task name is designed to blend in with legitimate system tasks.
 
@@ -420,7 +420,7 @@ EOF
 EOF
         FIRST_PLOG=$(ls "$PERSIST_DIR"/*_persist.txt 2>/dev/null | head -1)
         if [[ -f "$FIRST_PLOG" ]]; then
-            LAST_SUMMARY_LINE=$(grep -n "--- Persistence Summary ---" "$FIRST_PLOG" | tail -1 | cut -d: -f1)
+            LAST_SUMMARY_LINE=$(grep -n -- "--- Persistence Summary ---" "$FIRST_PLOG" | tail -1 | cut -d: -f1)
             if [[ -n "$LAST_SUMMARY_LINE" ]]; then
                 tail -n "+${LAST_SUMMARY_LINE}" "$FIRST_PLOG" | \
                     grep -v "^\[\*\]\|^\[-\]\|^\[+\]\|ENVCHANGE\|INFO(\|Impacket\|Press\|Encryption required\|^NULL$\|^------" | \
@@ -432,7 +432,7 @@ EOF
 
 **Assets Affected:** $PERSIST_HOSTS
 
-**Recommendation:** $CLIENT_NAME should deploy application whitelisting (e.g., Windows Defender Application Control or AppLocker) to prevent unauthorized scripts from executing. PowerShell should be configured in Constrained Language Mode on servers where full scripting is not required. Scheduled task creation should be monitored via Windows Event Log (Event ID 4698) and alerting should be configured for any new tasks created under the SYSTEM account. The c:\\windows\\temp directory should be regularly audited for unexpected files.
+**Recommendation:** $CLIENT_NAME should deploy application whitelisting (e.g., Windows Defender Application Control or AppLocker) to prevent unauthorized scripts from executing. PowerShell should be configured in Constrained Language Mode on servers where full scripting is not required. Scheduled task creation should be monitored via Windows Event Log (Event ID 4698) and alerting should be configured for any new tasks created under the SYSTEM account. The \`c:\\windows\\temp\` directory should be regularly audited for unexpected files.
 
 EOF
     fi
@@ -500,9 +500,9 @@ EOF
     fi
 
 
-    ==
+#    ==
     # 5. APPENDIX A: SEVERITY DEFINITIONS + MITRE ATT&CK
-    ==
+#    ==
     cat >> "$MD_FILE" <<'EOF'
 
 # Appendix A: Severity Definitions and MITRE ATT&CK Mapping
@@ -539,9 +539,9 @@ The following MITRE ATT&CK techniques were demonstrated during this engagement:
 
 EOF
 
-    ==
+#    ==
     # 6. APPENDIX B: HOSTS AND SERVICES
-    ==
+#    ==
     cat >> "$MD_FILE" <<'EOF'
 
 # Appendix B: Hosts and Services
@@ -603,9 +603,9 @@ EOF
         echo "" >> "$MD_FILE"
     done
 
-    ==
+#    ==
     # 7. APPENDIX C: TOOL LIST
-    ==
+#    ==
     cat >> "$MD_FILE" <<'EOF'
 
 # Appendix C: Tool List
@@ -622,9 +622,9 @@ The following tools were used during this engagement:
 
 EOF
 
-    ==
+#    ==
     # 8. APPENDIX D: ADDITIONAL REFERENCES
-    ==
+#    ==
     cat >> "$MD_FILE" <<'EOF'
 
 # Appendix D: Additional References
@@ -644,9 +644,9 @@ The following external resources provide guidance on hardening and securing the 
 
 EOF
 
-    ==
+#    ==
     # FOOTER
-    ==
+#    ==
     cat >> "$MD_FILE" <<EOF
 
 ---
@@ -659,9 +659,9 @@ EOF
     echo "[+] Markdown report built: $MD_FILE"
 }
 
---
+#--
 # Convert to PDF
---
+#--
 generate_pdf() {
     echo "[*] Converting to PDF..."
     pandoc "$MD_FILE" \
@@ -682,9 +682,9 @@ generate_pdf() {
     fi
 }
 
---
+#--
 # Main
---
+#--
 echo "[*] Starting report generation"
 check_deps
 gather_context
