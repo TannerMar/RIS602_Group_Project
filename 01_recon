@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+
+# Discovers live hosts, open ports, and identifies MSSQL servers in scope.
+# Outputs IP:PORT pairs to recon/hosts/mssql-targets.txt for the next script.
+
+CIDR="$1"
+
+if [[ -z "$CIDR" ]]; then
+    echo "Usage: $0 <cidr>"
+    exit 1
+fi
+OUTDIR="./recon"
+mkdir -p "$OUTDIR/hosts" "$OUTDIR/services"
+TARGETS_FILE="$OUTDIR/hosts/targets.txt"
+MSSQL_FILE="$OUTDIR/hosts/mssql-targets.txt"
+
+echo "[*] Starting recon on $CIDR"
+
+# Ping sweep to find live hosts
+echo "[*] Phase 1: Host discovery..."
+nmap -n -sn "$CIDR" --min-rate 10000 -oG "$OUTDIR/hosts/ping-sweep.gnmap" > /dev/null
+grep "Up$" "$OUTDIR/hosts/ping-sweep.gnmap" | awk '{print $2}' > "$TARGETS_FILE"
+echo "[+] Found $(wc -l < "$TARGETS_FILE") live hosts"
+cat "$TARGETS_FILE" | sed 's/^/    /'
+
+# Scan port 1433 against all live hosts
+echo "[*] Phase 2: Scanning port 1433 on live hosts..."
+nmap -Pn -n -p 1433 -iL "$TARGETS_FILE" --min-rate 5000 -oG "$OUTDIR/services/mssql-sweep.gnmap" > /dev/null
+
+# Pull any host where 1433 shows as open
+echo "[*] Phase 3: Identifying MSSQL servers..."
+> "$MSSQL_FILE"
+grep "1433/open" "$OUTDIR/services/mssql-sweep.gnmap" | awk '{print $2":1433"}' >> "$MSSQL_FILE"
+
+MSSQL_COUNT=$(wc -l < "$MSSQL_FILE")
+echo "[+] $MSSQL_COUNT MSSQL target(s) found"
+if [[ $MSSQL_COUNT -eq 0 ]]; then
+    echo "[-] No MSSQL servers found."
+    exit 1
+fi
+cat "$MSSQL_FILE" | sed 's/^/    /'

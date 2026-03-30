@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+
+read -p "Enter a CIDR for the scan: " CIDR
+
+./01_recon "$CIDR"
+./02_bruteforce
+./03_xpcmdshell
+./04_hashdump
+./05_persist
+./06_pivot
+./07_cleanup
+./08_report

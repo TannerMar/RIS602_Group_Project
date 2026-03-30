@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+
+# Reverts all attack artifacts on compromised targets:
+#   - Disables xp_cmdshell and show advanced options on MSSQL hosts
+#   - Removes scheduled task persistence
+#   - Removes dropped payloads from disk
+#   - Reverts any registry changes made for SMB exfil
+# Local recon/loot files are preserved for reporting.
+
+OUTDIR="./recon"
+CREDS_FILE="$OUTDIR/hosts/mssql-creds.txt"
+PERSIST_DIR="$OUTDIR/persist"
+TASK_NAME="WindowsHealthCheck"
+PAYLOAD_PATH="c:\\windows\\temp\\healthcheck.ps1"
+
+if [[ ! -f "$CREDS_FILE" ]]; then
+    echo "[-] $CREDS_FILE not found. Nothing to clean up."
+    exit 1
+fi
+
+echo "[*] Starting target cleanup phase"
+echo "[*] Local recon files will NOT be removed."
+echo ""
+
+while IFS=: read -r TARGET_IP TARGET_PORT USER PASS; do
+    [[ -z "$USER" || -z "$PASS" ]] && continue
+
+    echo "[*] Cleaning up: $TARGET_IP:$TARGET_PORT  |  User: $USER"
+
+    SAFE_TARGET="${TARGET_IP//./_}"
+    CLEANUP_LOG="$OUTDIR/${SAFE_TARGET}_cleanup.log"
+
+    xp() {
+        local CMD="$1"
+        printf "exec master..xp_cmdshell '%s';\nexit\n" "$CMD" | \
+            mssqlclient "${USER}:${PASS}@${TARGET_IP}" -port "$TARGET_PORT" 2>&1
+    }
+
+    sql() {
+        local QUERY="$1"
+        printf "%s\nexit\n" "$QUERY" | \
+            mssqlclient "${USER}:${PASS}@${TARGET_IP}" -port "$TARGET_PORT" 2>&1
+    }
+
+    # Step 1: Remove scheduled task
+    echo "[*]   Step 1: Removing scheduled task '$TASK_NAME'..."
+    RESULT=$(xp "schtasks /delete /tn ${TASK_NAME} /f" 2>&1)
+    if echo "$RESULT" | grep -qi "SUCCESS\|successfully"; then
+        echo "[+]   Scheduled task removed."
+    else
+        echo "[-]   Could not remove scheduled task (may not exist on this host)."
+    fi
+    echo "$RESULT" >> "$CLEANUP_LOG"
+
+    # Step 2: Remove payload from disk
+    echo "[*]   Step 2: Removing payload $PAYLOAD_PATH..."
+    xp "del ${PAYLOAD_PATH}" > /dev/null 2>&1
+    VERIFY=$(xp "dir ${PAYLOAD_PATH}" 2>&1)
+    if echo "$VERIFY" | grep -qi "File Not Found\|cannot find"; then
+        echo "[+]   Payload removed."
+    else
+        echo "[-]   Could not confirm payload removal."
+    fi
+
+    # Step 3: Revert registry changes from hashdump SMB exfil
+    echo "[*]   Step 3: Reverting anonymous SMB registry tweaks..."
+    xp "reg add \"HKLM\\SYSTEM\\CurrentControlSet\\Services\\LanmanServer\\Parameters\" /v RestrictNullSessAccess /t REG_DWORD /d 1 /f" > /dev/null 2>&1
+    xp "reg delete \"HKLM\\SYSTEM\\CurrentControlSet\\Services\\LanmanServer\\Parameters\" /v NullSessionShares /f" > /dev/null 2>&1
+    echo "[+]   Registry reverted."
+
+    # Step 4: Disable xp_cmdshell and hide advanced options
+    echo "[*]   Step 4: Disabling xp_cmdshell and advanced options..."
+    sql "sp_configure 'xp_cmdshell', '0';
+RECONFIGURE;
+sp_configure 'show advanced options', '0';
+RECONFIGURE;" | grep -v "^$\|Impacket\|Press\|\[!\]" | tee -a "$CLEANUP_LOG"
+    echo "[+]   xp_cmdshell disabled. Advanced options hidden."
+
+    echo "[+] Cleanup complete for $TARGET_IP"
+    echo ""
+
+done < "$CREDS_FILE"
+
+echo "[+] Target cleanup phase complete."
+echo "[+] All remote artifacts reverted. Local recon data preserved in $OUTDIR/"

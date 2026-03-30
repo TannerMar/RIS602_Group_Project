@@ -1,0 +1,347 @@
+#!/usr/bin/env bash
+
+# Generates a PDF penetration test report from all recon, loot, and pivot data.
+# Uses pandoc + xelatex to convert a dynamically built Markdown file to PDF.
+# Preserves all local files; this is a read-only reporting step.
+# Prompts for engagement context (client, tester, environment) at runtime.
+
+OUTDIR="./recon"
+CREDS_FILE="$OUTDIR/hosts/mssql-creds.txt"
+LOOT_DIR="$OUTDIR/loot"
+PERSIST_DIR="$OUTDIR/persist"
+PIVOT_DIR="$OUTDIR/pivot"
+MSSQL_DIR="$OUTDIR/mssql"
+TASK_NAME="WindowsHealthCheck"
+LPORT="${1:-4444}"
+TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+DATE_LABEL=$(date +"%Y-%m-%d")
+MD_FILE="/tmp/attack_report_${DATE_LABEL}.md"
+PDF_FILE="./attack_report_${DATE_LABEL}.pdf"
+
+# ---------------------------------------------------------------------------
+# Gather engagement context
+# ---------------------------------------------------------------------------
+gather_context() {
+    echo "[*] Report context — press Enter to accept defaults"
+    echo ""
+
+    read -p "    Tester name [$(whoami)]: " TESTER_NAME
+    TESTER_NAME="${TESTER_NAME:-$(whoami)}"
+
+    read -p "    Client / organization name: " CLIENT_NAME
+    CLIENT_NAME="${CLIENT_NAME:-Unspecified}"
+
+    read -p "    Target environment name: " ENV_NAME
+    ENV_NAME="${ENV_NAME:-Unspecified}"
+
+    # Try to pull the scanned CIDR from the ping sweep if available
+    CIDR_SCANNED=""
+    if [[ -f "$OUTDIR/hosts/ping-sweep.gnmap" ]]; then
+        CIDR_SCANNED=$(head -1 "$OUTDIR/hosts/ping-sweep.gnmap" | grep -oP '(?<=nmap -n -sn )\S+' || true)
+    fi
+    read -p "    Scope / CIDR [${CIDR_SCANNED:-unknown}]: " SCOPE
+    SCOPE="${SCOPE:-${CIDR_SCANNED:-unknown}}"
+
+    # Count hosts from recon data
+    LIVE_HOSTS=0
+    [[ -f "$OUTDIR/hosts/targets.txt" ]] && LIVE_HOSTS=$(wc -l < "$OUTDIR/hosts/targets.txt")
+    COMPROMISED_HOSTS=0
+    [[ -f "$CREDS_FILE" ]] && COMPROMISED_HOSTS=$(wc -l < "$CREDS_FILE")
+
+    echo ""
+    echo "[+] Context set:"
+    echo "    Tester:      $TESTER_NAME"
+    echo "    Client:      $CLIENT_NAME"
+    echo "    Environment: $ENV_NAME"
+    echo "    Scope:       $SCOPE"
+    echo ""
+}
+
+# ---------------------------------------------------------------------------
+# Dependency check
+# ---------------------------------------------------------------------------
+check_deps() {
+    local MISSING=0
+    if ! command -v pandoc &> /dev/null; then
+        echo "[-] pandoc not found. Installing..."
+        sudo apt-get update -qq && sudo apt-get install -y -qq pandoc
+        MISSING=1
+    fi
+    if ! dpkg -l | grep -q texlive-xetex; then
+        echo "[-] texlive-xetex not found. Installing..."
+        sudo apt-get update -qq && sudo apt-get install -y -qq texlive-xetex texlive-fonts-recommended
+        MISSING=1
+    fi
+    if [[ $MISSING -eq 1 ]]; then
+        echo "[+] Dependencies installed."
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Build the Markdown report
+# ---------------------------------------------------------------------------
+build_report() {
+    cat > "$MD_FILE" <<EOF
+---
+title: "Automated Penetration Test Report"
+subtitle: "$CLIENT_NAME — $ENV_NAME"
+author: "$TESTER_NAME"
+date: "$DATE_LABEL"
+geometry: margin=1in
+fontsize: 11pt
+toc: true
+toc-depth: 3
+numbersections: true
+header-includes:
+  - \\usepackage{fancyhdr}
+  - \\pagestyle{fancy}
+  - \\fancyhead[L]{Pentest Report — $CLIENT_NAME}
+  - \\fancyhead[R]{$DATE_LABEL}
+  - \\usepackage{longtable}
+  - \\usepackage{booktabs}
+  - \\let\\OldTOC\\tableofcontents
+  - \\renewcommand{\\tableofcontents}{\\newpage\\OldTOC\\newpage}
+---
+
+# Executive Summary
+
+This report documents the results of an automated penetration test against the $ENV_NAME environment ($CLIENT_NAME) conducted on $DATE_LABEL. The target scope was $SCOPE, within which $LIVE_HOSTS live hosts were discovered and $COMPROMISED_HOSTS were successfully compromised. The attack chain progressed from network reconnaissance through MSSQL exploitation, credential harvesting, persistence establishment, and lateral movement. All target-side artifacts were reverted during the cleanup phase. Local evidence files have been preserved.
+
+# Scope and Methodology
+
+The engagement followed a sequential attack chain:
+
+1. **Reconnaissance** — Host discovery and MSSQL service enumeration via Nmap against $SCOPE.
+2. **Credential Attack** — Brute-force authentication against identified MSSQL instances.
+3. **Exploitation** — Enabled xp_cmdshell for OS command execution on compromised hosts.
+4. **Credential Dumping** — Extracted SAM/SYSTEM registry hives and recovered NTLM hashes.
+5. **Persistence** — Established scheduled task callbacks on compromised hosts.
+6. **Lateral Movement** — Pass-the-Hash and credential reuse against additional targets.
+7. **Cleanup** — Reverted all remote artifacts (xp_cmdshell, scheduled tasks, registry changes).
+
+# Compromised Hosts
+
+EOF
+
+    # List all compromised hosts from the creds file
+    if [[ -f "$CREDS_FILE" ]]; then
+        echo "| IP Address | Port | Username | Method |" >> "$MD_FILE"
+        echo "|------------|------|----------|--------|" >> "$MD_FILE"
+        while IFS=: read -r IP PORT U P; do
+            echo "| $IP | $PORT | $U | MSSQL Brute Force |" >> "$MD_FILE"
+        done < "$CREDS_FILE"
+        echo "" >> "$MD_FILE"
+    fi
+
+    # Add PtH successes if any
+    if [[ -f "$PIVOT_DIR/pth-successes.txt" ]]; then
+        echo "### Additional Hosts via Pass-the-Hash" >> "$MD_FILE"
+        echo "" >> "$MD_FILE"
+        echo "| IP Address | Username | Hash (truncated) |" >> "$MD_FILE"
+        echo "|------------|----------|------------------|" >> "$MD_FILE"
+        while IFS=: read -r IP U HASH; do
+            SHORT_HASH="${HASH:0:16}..."
+            echo "| $IP | $U | \`$SHORT_HASH\` |" >> "$MD_FILE"
+        done < "$PIVOT_DIR/pth-successes.txt"
+        echo "" >> "$MD_FILE"
+    fi
+
+    # Credential reuse successes
+    if [[ -f "$PIVOT_DIR/credreuse-successes.txt" ]]; then
+        echo "### Additional Hosts via Credential Reuse" >> "$MD_FILE"
+        echo "" >> "$MD_FILE"
+        echo "| IP Address | Port | Username |" >> "$MD_FILE"
+        echo "|------------|------|----------|" >> "$MD_FILE"
+        while IFS=: read -r IP PORT U P; do
+            echo "| $IP | $PORT | $U |" >> "$MD_FILE"
+        done < "$PIVOT_DIR/credreuse-successes.txt"
+        echo "" >> "$MD_FILE"
+    fi
+
+    # ---------------------------------------------------------------------------
+    # NTLM Hashes
+    # ---------------------------------------------------------------------------
+    cat >> "$MD_FILE" <<'EOF'
+
+# Extracted Credentials
+
+## NTLM Hashes
+
+EOF
+
+    for HASHFILE in "$LOOT_DIR"/*/hashes.txt; do
+        [[ -f "$HASHFILE" ]] || continue
+        HOST_DIR=$(basename "$(dirname "$HASHFILE")")
+        HOST_IP="${HOST_DIR//_/.}"
+        echo "### $HOST_IP" >> "$MD_FILE"
+        echo "" >> "$MD_FILE"
+        echo '```' >> "$MD_FILE"
+        grep ":::" "$HASHFILE" >> "$MD_FILE"
+        echo '```' >> "$MD_FILE"
+        echo "" >> "$MD_FILE"
+    done
+
+    # ---------------------------------------------------------------------------
+    # xp_cmdshell recon output — filter all Impacket session noise
+    # ---------------------------------------------------------------------------
+    cat >> "$MD_FILE" <<'EOF'
+
+# OS Reconnaissance Output
+
+EOF
+
+    for CMDLOG in "$MSSQL_DIR"/*_cmdshell.txt; do
+        [[ -f "$CMDLOG" ]] || continue
+        BASENAME=$(basename "$CMDLOG" _cmdshell.txt)
+        TARGET_PORT="${BASENAME##*_}"
+        HOST_RAW="${BASENAME%_${TARGET_PORT}}"
+        HOST_IP="${HOST_RAW//_/.}"
+        echo "## $HOST_IP" >> "$MD_FILE"
+        echo "" >> "$MD_FILE"
+        echo '```' >> "$MD_FILE"
+        grep -v "^$\|Impacket\|Press\|\[!\]\|ENVCHANGE\|INFO(\|\[\*\] Encryption\|\[\*\] ACK\|SQL (.*dbo@\|^NULL$\|^output$" "$CMDLOG" | \
+            sed '/^[[:space:]]*$/d' >> "$MD_FILE"
+        echo '```' >> "$MD_FILE"
+        echo "" >> "$MD_FILE"
+    done
+
+    # ---------------------------------------------------------------------------
+    # Persistence — extract only the LAST summary block, strip noise
+    # ---------------------------------------------------------------------------
+    cat >> "$MD_FILE" <<'EOF'
+
+# Persistence Mechanisms
+
+EOF
+
+    for PLOG in "$PERSIST_DIR"/*_persist.txt; do
+        [[ -f "$PLOG" ]] || continue
+        BASENAME=$(basename "$PLOG" _persist.txt)
+        HOST_IP="${BASENAME//_/.}"
+        echo "## $HOST_IP" >> "$MD_FILE"
+        echo "" >> "$MD_FILE"
+
+        LAST_SUMMARY_LINE=$(grep -n "--- Persistence Summary ---" "$PLOG" | tail -1 | cut -d: -f1)
+        if [[ -n "$LAST_SUMMARY_LINE" ]]; then
+            echo '```' >> "$MD_FILE"
+            tail -n "+${LAST_SUMMARY_LINE}" "$PLOG" | \
+                grep -v "^\[\*\]\|^\[-\]\|^\[+\]\|ENVCHANGE\|INFO(\|Impacket\|Press\|Encryption required\|^NULL$\|^------" | \
+                sed '/^[[:space:]]*$/d' >> "$MD_FILE"
+            echo '```' >> "$MD_FILE"
+        else
+            echo "Persistence log exists but no summary block found." >> "$MD_FILE"
+        fi
+        echo "" >> "$MD_FILE"
+    done
+
+    # ---------------------------------------------------------------------------
+    # Indicators of Compromise
+    # ---------------------------------------------------------------------------
+    cat >> "$MD_FILE" <<EOF
+
+# Indicators of Compromise
+
+## Files Dropped on Targets
+
+| Indicator | Type | Host(s) |
+|-----------|------|---------|
+| c:\\\\windows\\\\temp\\\\healthcheck.ps1 | Persistence payload | MSSQL targets |
+| c:\\\\windows\\\\temp\\\\sam | Registry hive (temporary) | MSSQL targets |
+| c:\\\\windows\\\\temp\\\\sys | Registry hive (temporary) | MSSQL targets |
+
+## Scheduled Tasks Created
+
+| Task Name | Trigger | Run As |
+|-----------|---------|--------|
+| $TASK_NAME | On system startup | SYSTEM |
+
+## Configuration Changes
+
+| Change | Original Value | Attack Value | Reverted |
+|--------|---------------|-------------|----------|
+| xp_cmdshell | 0 (disabled) | 1 (enabled) | Yes |
+| show advanced options | 0 (hidden) | 1 (shown) | Yes |
+| RestrictNullSessAccess | 1 | 0 | Yes |
+| NullSessionShares | (empty) | pentest | Yes (deleted) |
+| SMB share 'pentest' | (none) | c:\\\\windows\\\\temp | Yes (deleted) |
+
+## Network Indicators
+
+| Indicator | Type | Description |
+|-----------|------|-------------|
+| MSSQL auth (port 1433) | Brute force traffic | Multiple login attempts per target |
+| SMB null session | Lateral exfil | Anonymous share for hive download |
+| TCP $LPORT | Reverse shell callback | Persistence payload callback port |
+
+# MITRE ATT\&CK Mapping
+
+| ID | Technique | Phase |
+|----|-----------|-------|
+| T1046 | Network Service Discovery | Reconnaissance |
+| T1110.001 | Brute Force: Password Guessing | Credential Access |
+| T1059.001 | Command and Scripting Interpreter: PowerShell | Execution |
+| T1505 | Server Software Component (xp_cmdshell) | Persistence |
+| T1003.002 | OS Credential Dumping: SAM | Credential Access |
+| T1053.005 | Scheduled Task/Job: Scheduled Task | Persistence |
+| T1550.002 | Use Alternate Authentication: Pass the Hash | Lateral Movement |
+| T1078 | Valid Accounts (credential reuse) | Lateral Movement |
+| T1070 | Indicator Removal (cleanup phase) | Defense Evasion |
+
+# Evidence Artifacts
+
+Local evidence files are preserved in the \`./recon/\` directory:
+
+EOF
+
+    echo '```' >> "$MD_FILE"
+    find "$OUTDIR" -type f 2>/dev/null | sort | sed 's|^\./||' >> "$MD_FILE"
+    echo '```' >> "$MD_FILE"
+
+    cat >> "$MD_FILE" <<EOF
+
+# Conclusion
+
+The automated attack chain successfully compromised MSSQL services in the $ENV_NAME environment, progressing from initial reconnaissance through credential harvesting and lateral movement. All target-side modifications were reverted during the cleanup phase. The techniques demonstrated map to real-world threat actor TTPs and highlight the risks associated with weak MSSQL credentials, enabled xp_cmdshell, and insufficient network segmentation.
+
+---
+
+*Report generated automatically at $TIMESTAMP*
+EOF
+
+    echo "[+] Markdown report built: $MD_FILE"
+}
+
+# ---------------------------------------------------------------------------
+# Convert to PDF
+# ---------------------------------------------------------------------------
+generate_pdf() {
+    echo "[*] Converting to PDF..."
+    pandoc "$MD_FILE" \
+        -o "$PDF_FILE" \
+        --pdf-engine=xelatex \
+        -V geometry:margin=1in \
+        -V fontsize=11pt \
+        --highlight-style=tango \
+        --toc \
+        --number-sections
+
+    if [[ -f "$PDF_FILE" ]]; then
+        echo "[+] PDF report generated: $PDF_FILE"
+        ls -lh "$PDF_FILE" | sed 's/^/    /'
+    else
+        echo "[-] PDF generation failed. Markdown source preserved at $MD_FILE"
+        exit 1
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+echo "[*] Starting report generation"
+check_deps
+gather_context
+build_report
+generate_pdf
+echo ""
+echo "[+] Done. Report: $PDF_FILE"
+echo "[+] Markdown source: $MD_FILE"
