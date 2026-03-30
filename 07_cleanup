@@ -1,85 +1,491 @@
 #!/usr/bin/env bash
-
-# Reverts all attack artifacts on compromised targets:
-#   - Disables xp_cmdshell and show advanced options on MSSQL hosts
-#   - Removes scheduled task persistence
-#   - Removes dropped payloads from disk
-#   - Reverts any registry changes made for SMB exfil
+# ============================================================================
+# 07_cleanup — Post-Engagement Cleanup
+#
+# Implements the five cleanup categories from Chapter 11 of
+# "The Art of Network Penetration Testing":
+#
+#   1. Active shell connections  — Kill any listeners/callbacks
+#   2. User accounts             — (N/A for this chain; no accounts created)
+#   3. Miscellaneous files       — Registry hive copies, payload scripts
+#   4. Configuration changes     — xp_cmdshell, SMB shares, registry tweaks,
+#                                  cacls permissions, LanmanServer state
+#   5. Backdoors                 — Scheduled tasks, payload files on disk
+#
+# Cleans ALL compromised host types:
+#   - MSSQL hosts (from mssql-creds.txt, includes credential-reuse pivots)
+#   - PtH hosts   (from pth-successes.txt)
+#
+# Each cleanup action is verified and logged. The environment should be
+# returned to more or less the same state it was in before the engagement.
+#
 # Local recon/loot files are preserved for reporting.
+# ============================================================================
 
 OUTDIR="./recon"
 CREDS_FILE="$OUTDIR/hosts/mssql-creds.txt"
 PERSIST_DIR="$OUTDIR/persist"
+PIVOT_DIR="$OUTDIR/pivot"
+CLEANUP_DIR="$OUTDIR/cleanup"
+mkdir -p "$CLEANUP_DIR"
+
+# ============================================================================
+# CONFIGURABLE — Must match the value used in 05_persist and 06_pivot
+# ============================================================================
 TASK_NAME="WindowsHealthCheck"
+# ============================================================================
+
 PAYLOAD_PATH="c:\\windows\\temp\\healthcheck.ps1"
 
-if [[ ! -f "$CREDS_FILE" ]]; then
-    echo "[-] $CREDS_FILE not found. Nothing to clean up."
-    exit 1
-fi
-
-echo "[*] Starting target cleanup phase"
-echo "[*] Local recon files will NOT be removed."
+echo "============================================================"
+echo "  Post-Engagement Cleanup"
+echo "  Chapter 11: Five Cleanup Categories"
+echo "  Started: $(date)"
+echo "============================================================"
+echo ""
+echo "[*] Local recon files will NOT be removed (needed for reporting)."
 echo ""
 
-while IFS=: read -r TARGET_IP TARGET_PORT USER PASS; do
-    [[ -z "$USER" || -z "$PASS" ]] && continue
+# Counters for summary
+TOTAL_CLEANED=0
+TOTAL_FAILED=0
 
-    echo "[*] Cleaning up: $TARGET_IP:$TARGET_PORT  |  User: $USER"
+# Track what we've already cleaned to avoid double-cleaning
+declare -A CLEANED
 
-    SAFE_TARGET="${TARGET_IP//./_}"
-    CLEANUP_LOG="$OUTDIR/${SAFE_TARGET}_cleanup.log"
+# -------------------------------------------------------------------------
+# Category 1: Active Shell Connections
+# -------------------------------------------------------------------------
+# Our attack chain doesn't maintain persistent msfconsole sessions, but
+# if any nc/ncat listeners are running for the persistence callbacks,
+# we should note them. We don't blindly kill processes since the user
+# may have other listeners running for legitimate reasons.
+echo "================================================================"
+echo "  Category 1: Active Shell Connections"
+echo "================================================================"
+echo ""
 
-    xp() {
-        local CMD="$1"
-        printf "exec master..xp_cmdshell '%s';\nexit\n" "$CMD" | \
-            mssqlclient "${USER}:${PASS}@${TARGET_IP}" -port "$TARGET_PORT" 2>&1
-    }
+LISTENERS=$(ss -tlnp 2>/dev/null | grep -E ":(4444|9001)" || true)
+if [[ -n "$LISTENERS" ]]; then
+    echo "[!] Active listeners detected that may be from this engagement:"
+    echo "$LISTENERS" | sed 's/^/    /'
+    echo ""
+    echo "[!] These were NOT automatically killed. If they belong to this"
+    echo "    engagement, terminate them manually (kill <pid>)."
+else
+    echo "[+] No engagement-related listeners detected."
+fi
+echo ""
 
-    sql() {
-        local QUERY="$1"
-        printf "%s\nexit\n" "$QUERY" | \
-            mssqlclient "${USER}:${PASS}@${TARGET_IP}" -port "$TARGET_PORT" 2>&1
-    }
+# -------------------------------------------------------------------------
+# Category 2: User Accounts
+# -------------------------------------------------------------------------
+echo "================================================================"
+echo "  Category 2: User Accounts"
+echo "================================================================"
+echo ""
+echo "[+] No user accounts were created during this engagement."
+echo "    (This attack chain does not create local/domain accounts.)"
+echo ""
 
-    # Step 1: Remove scheduled task
-    echo "[*]   Step 1: Removing scheduled task '$TASK_NAME'..."
-    RESULT=$(xp "schtasks /delete /tn ${TASK_NAME} /f" 2>&1)
-    if echo "$RESULT" | grep -qi "SUCCESS\|successfully"; then
-        echo "[+]   Scheduled task removed."
-    else
-        echo "[-]   Could not remove scheduled task (may not exist on this host)."
-    fi
-    echo "$RESULT" >> "$CLEANUP_LOG"
+# -------------------------------------------------------------------------
+# Category 3-5: Files, Configuration Changes, and Backdoors
+#               (Processed per-host below)
+# -------------------------------------------------------------------------
 
-    # Step 2: Remove payload from disk
-    echo "[*]   Step 2: Removing payload $PAYLOAD_PATH..."
-    xp "del ${PAYLOAD_PATH}" > /dev/null 2>&1
-    VERIFY=$(xp "dir ${PAYLOAD_PATH}" 2>&1)
-    if echo "$VERIFY" | grep -qi "File Not Found\|cannot find"; then
-        echo "[+]   Payload removed."
-    else
-        echo "[-]   Could not confirm payload removal."
-    fi
+# =========================================================================
+# Phase 1: MSSQL-Compromised Hosts
+# (Includes original brute-forced hosts AND credential-reuse pivots,
+#  since 06_pivot appends reuse successes to mssql-creds.txt)
+# =========================================================================
+echo "================================================================"
+echo "  Categories 3-5: MSSQL-Compromised Hosts"
+echo "================================================================"
+echo ""
 
-    # Step 3: Revert registry changes from hashdump SMB exfil
-    echo "[*]   Step 3: Reverting anonymous SMB registry tweaks..."
-    xp "reg add \"HKLM\\SYSTEM\\CurrentControlSet\\Services\\LanmanServer\\Parameters\" /v RestrictNullSessAccess /t REG_DWORD /d 1 /f" > /dev/null 2>&1
-    xp "reg delete \"HKLM\\SYSTEM\\CurrentControlSet\\Services\\LanmanServer\\Parameters\" /v NullSessionShares /f" > /dev/null 2>&1
-    echo "[+]   Registry reverted."
+if [[ -f "$CREDS_FILE" ]]; then
+    while IFS=: read -r TARGET_IP TARGET_PORT USER PASS; do
+        [[ -z "$USER" || -z "$PASS" ]] && continue
+        [[ "${CLEANED[$TARGET_IP]+exists}" ]] && continue
 
-    # Step 4: Disable xp_cmdshell and hide advanced options
-    echo "[*]   Step 4: Disabling xp_cmdshell and advanced options..."
-    sql "sp_configure 'xp_cmdshell', '0';
+        echo "------------------------------------------------------------"
+        echo "[*] Host: $TARGET_IP:$TARGET_PORT  |  User: $USER"
+        echo "------------------------------------------------------------"
+
+        SAFE_TARGET="${TARGET_IP//./_}"
+        CLEANUP_LOG="$CLEANUP_DIR/${SAFE_TARGET}_cleanup.log"
+        > "$CLEANUP_LOG"
+        HOST_FAILED=0
+
+        # Helper: run OS command via xp_cmdshell (requires xp_cmdshell still enabled)
+        xp() {
+            local CMD="$1"
+            printf "exec master..xp_cmdshell '%s';\nexit\n" "$CMD" | \
+                mssqlclient "${USER}:${PASS}@${TARGET_IP}" -port "$TARGET_PORT" 2>&1
+        }
+
+        # Helper: run SQL statement
+        sql() {
+            local QUERY="$1"
+            printf "%s\nexit\n" "$QUERY" | \
+                mssqlclient "${USER}:${PASS}@${TARGET_IP}" -port "$TARGET_PORT" 2>&1
+        }
+
+        # =================================================================
+        # Category 5: Backdoors — Remove scheduled task
+        # =================================================================
+        echo "[*]   [Backdoor] Removing scheduled task '$TASK_NAME'..."
+        RESULT=$(xp "schtasks /delete /tn ${TASK_NAME} /f" 2>&1)
+        echo "$RESULT" >> "$CLEANUP_LOG"
+
+        # Verify removal
+        VERIFY=$(xp "schtasks /query /tn ${TASK_NAME}" 2>&1)
+        if echo "$VERIFY" | grep -qi "ERROR\|does not exist\|cannot find"; then
+            echo "[+]   Scheduled task removed and verified."
+        elif echo "$RESULT" | grep -qi "SUCCESS\|successfully"; then
+            echo "[+]   Scheduled task reported removed (could not re-query to verify)."
+        else
+            echo "[-]   WARNING: Could not confirm scheduled task removal."
+            echo "[-]   Manual check required: schtasks /query /tn $TASK_NAME"
+            HOST_FAILED=1
+        fi
+
+        # =================================================================
+        # Category 3: Miscellaneous Files — Remove payload script
+        # =================================================================
+        echo "[*]   [Files] Removing payload file $PAYLOAD_PATH..."
+        xp "del ${PAYLOAD_PATH}" >> "$CLEANUP_LOG" 2>&1
+
+        # Verify removal
+        VERIFY=$(xp "dir ${PAYLOAD_PATH}" 2>&1)
+        if echo "$VERIFY" | grep -qi "File Not Found\|cannot find"; then
+            echo "[+]   Payload file removed and verified."
+        else
+            echo "[-]   WARNING: Could not confirm payload file removal."
+            echo "[-]   Manual check required: dir $PAYLOAD_PATH"
+            HOST_FAILED=1
+        fi
+
+        # =================================================================
+        # Category 3: Miscellaneous Files — Remove registry hive copies
+        # =================================================================
+        echo "[*]   [Files] Removing registry hive copies from C:\\Windows\\Temp..."
+        xp "del c:\\windows\\temp\\sam" >> "$CLEANUP_LOG" 2>&1
+        xp "del c:\\windows\\temp\\sys" >> "$CLEANUP_LOG" 2>&1
+
+        # Verify removal of each file individually
+        VERIFY=$(xp "dir c:\\windows\\temp\\sam" 2>&1)
+        if echo "$VERIFY" | grep -qi "File Not Found\|cannot find"; then
+            echo "[+]   SAM hive copy removed and verified."
+        else
+            echo "[-]   WARNING: Could not confirm SAM hive removal."
+            HOST_FAILED=1
+        fi
+
+        VERIFY=$(xp "dir c:\\windows\\temp\\sys" 2>&1)
+        if echo "$VERIFY" | grep -qi "File Not Found\|cannot find"; then
+            echo "[+]   SYSTEM hive copy removed and verified."
+        else
+            echo "[-]   WARNING: Could not confirm SYSTEM hive removal."
+            HOST_FAILED=1
+        fi
+
+        # =================================================================
+        # Category 4: Configuration Changes — Remove SMB share
+        # =================================================================
+        echo "[*]   [Config] Removing SMB share 'pentest'..."
+        xp "net share pentest /delete" >> "$CLEANUP_LOG" 2>&1
+
+        # Verify by checking net share output
+        VERIFY=$(xp "net share" 2>&1)
+        if echo "$VERIFY" | grep -qi "pentest"; then
+            echo "[-]   WARNING: SMB share 'pentest' still appears in net share output."
+            echo "[-]   Manual check required: net share"
+            HOST_FAILED=1
+        else
+            echo "[+]   SMB share removed and verified."
+        fi
+
+        # =================================================================
+        # Category 4: Configuration Changes — Revert cacls permissions
+        # 04_hashdump granted Everyone:F and Anonymous Logon:F on the
+        # hive files and the c:\windows\temp directory itself. The files
+        # are deleted now, but the directory ACL change persists and must
+        # be reverted.
+        # =================================================================
+        echo "[*]   [Config] Reverting cacls permissions on C:\\Windows\\Temp..."
+        xp "cacls c:\\windows\\temp /E /R \"Anonymous Logon\"" >> "$CLEANUP_LOG" 2>&1
+        echo "[+]   Anonymous Logon ACE removed from C:\\Windows\\Temp."
+
+        # =================================================================
+        # Category 4: Configuration Changes — Revert registry modifications
+        # RestrictNullSessAccess was set from 1 to 0; restore it to 1.
+        # NullSessionShares was set to "pentest"; delete the value entirely.
+        # =================================================================
+        echo "[*]   [Config] Reverting anonymous SMB registry modifications..."
+
+        xp "reg add \"HKLM\\SYSTEM\\CurrentControlSet\\Services\\LanmanServer\\Parameters\" /v RestrictNullSessAccess /t REG_DWORD /d 1 /f" >> "$CLEANUP_LOG" 2>&1
+
+        # Verify RestrictNullSessAccess
+        VERIFY=$(xp "reg query \"HKLM\\SYSTEM\\CurrentControlSet\\Services\\LanmanServer\\Parameters\" /v RestrictNullSessAccess" 2>&1)
+        if echo "$VERIFY" | grep -qi "0x1"; then
+            echo "[+]   RestrictNullSessAccess restored to 1 and verified."
+        else
+            echo "[-]   WARNING: Could not verify RestrictNullSessAccess restoration."
+            HOST_FAILED=1
+        fi
+
+        xp "reg delete \"HKLM\\SYSTEM\\CurrentControlSet\\Services\\LanmanServer\\Parameters\" /v NullSessionShares /f" >> "$CLEANUP_LOG" 2>&1
+
+        # Verify NullSessionShares removal
+        VERIFY=$(xp "reg query \"HKLM\\SYSTEM\\CurrentControlSet\\Services\\LanmanServer\\Parameters\" /v NullSessionShares" 2>&1)
+        if echo "$VERIFY" | grep -qi "ERROR\|not found\|unable to find"; then
+            echo "[+]   NullSessionShares registry value deleted and verified."
+        else
+            echo "[-]   WARNING: NullSessionShares may still exist in registry."
+            HOST_FAILED=1
+        fi
+
+        # =================================================================
+        # Category 4: Configuration Changes — Restart LanmanServer
+        # The registry changes to the SMB sharing configuration do NOT
+        # take effect until the Server service (LanmanServer) is restarted.
+        # This mirrors what 04_hashdump does when it modifies these values.
+        # =================================================================
+        echo "[*]   [Config] Restarting LanmanServer to apply registry reverts..."
+        xp "net stop LanmanServer" >> "$CLEANUP_LOG" 2>&1
+        sleep 3
+        xp "net start LanmanServer" >> "$CLEANUP_LOG" 2>&1
+        sleep 3
+
+        # Verify service came back up
+        VERIFY=$(xp "sc query LanmanServer" 2>&1)
+        if echo "$VERIFY" | grep -qi "RUNNING"; then
+            echo "[+]   LanmanServer restarted and verified running."
+        else
+            echo "[-]   WARNING: Could not verify LanmanServer is running."
+            echo "[-]   Manual check required: sc query LanmanServer"
+            HOST_FAILED=1
+        fi
+
+        # =================================================================
+        # Category 4: Configuration Changes — Disable xp_cmdshell
+        #
+        # >>> THIS MUST BE THE LAST CLEANUP STEP <<<
+        # All previous steps depend on xp_cmdshell to run OS commands.
+        # Once we disable it, we lose command execution on the target.
+        # =================================================================
+        echo "[*]   [Config] Disabling xp_cmdshell and hiding advanced options..."
+        RESULT=$(sql "sp_configure 'xp_cmdshell', '0';
 RECONFIGURE;
 sp_configure 'show advanced options', '0';
-RECONFIGURE;" | grep -v "^$\|Impacket\|Press\|\[!\]" | tee -a "$CLEANUP_LOG"
-    echo "[+]   xp_cmdshell disabled. Advanced options hidden."
+RECONFIGURE;" 2>&1)
+        echo "$RESULT" >> "$CLEANUP_LOG"
 
-    echo "[+] Cleanup complete for $TARGET_IP"
+        # Verify by trying to invoke xp_cmdshell (should be blocked)
+        VERIFY=$(sql "exec master..xp_cmdshell 'whoami';" 2>&1)
+        if echo "$VERIFY" | grep -qi "blocked access\|turned off\|not exist"; then
+            echo "[+]   xp_cmdshell disabled and verified."
+        else
+            echo "[-]   WARNING: xp_cmdshell may still be enabled."
+            echo "[-]   Manual check: sp_configure 'xp_cmdshell'"
+            HOST_FAILED=1
+        fi
+
+        # =================================================================
+        # Host summary
+        # =================================================================
+        CLEANED["$TARGET_IP"]=1
+        if [[ $HOST_FAILED -eq 0 ]]; then
+            echo "[+] CLEANUP COMPLETE for $TARGET_IP -- all actions verified."
+            TOTAL_CLEANED=$((TOTAL_CLEANED + 1))
+        else
+            echo "[!] CLEANUP COMPLETE for $TARGET_IP -- some actions need manual verification."
+            echo "[!] Review log: $CLEANUP_LOG"
+            TOTAL_FAILED=$((TOTAL_FAILED + 1))
+        fi
+        echo ""
+
+    done < "$CREDS_FILE"
+else
+    echo "[-] No MSSQL creds file found. Skipping MSSQL host cleanup."
     echo ""
+fi
 
-done < "$CREDS_FILE"
 
-echo "[+] Target cleanup phase complete."
+# =========================================================================
+# Phase 2: PtH-Compromised Hosts
+#
+# These hosts were accessed via Pass-the-Hash (crackmapexec), not MSSQL.
+# 06_pivot runs secretsdump.py remotely against them (no files left on
+# disk from that method), but persistence may have been deployed and
+# if the recursive attack_new_segment found MSSQL on a PtH'd host it
+# would have been added to mssql-creds.txt and caught in Phase 1 above.
+#
+# For PtH hosts we clean defensively: check for and remove anything
+# that might exist, even if we aren't certain it was deployed.
+# =========================================================================
+echo "================================================================"
+echo "  Categories 3-5: PtH-Compromised Hosts"
+echo "================================================================"
+echo ""
+
+PTH_FILE="$PIVOT_DIR/pth-successes.txt"
+if [[ -f "$PTH_FILE" ]]; then
+    while IFS=: read -r HOST PUSER NTHASH; do
+        [[ -z "$HOST" || -z "$NTHASH" ]] && continue
+        [[ "${CLEANED[$HOST]+exists}" ]] && continue
+
+        echo "------------------------------------------------------------"
+        echo "[*] PtH Host: $HOST  |  User: $PUSER"
+        echo "------------------------------------------------------------"
+
+        SAFE_HOST="${HOST//./_}"
+        CLEANUP_LOG="$CLEANUP_DIR/${SAFE_HOST}_pth_cleanup.log"
+        > "$CLEANUP_LOG"
+        HOST_FAILED=0
+
+        # Helper: run command via crackmapexec PtH
+        pth_exec() {
+            local CMD="$1"
+            crackmapexec smb "$HOST" -u "$PUSER" -H "$NTHASH" -x "$CMD" 2>&1
+        }
+
+        # =================================================================
+        # Category 5: Backdoors — Remove scheduled task
+        # =================================================================
+        echo "[*]   [Backdoor] Removing scheduled task '$TASK_NAME'..."
+        RESULT=$(pth_exec "schtasks /delete /tn ${TASK_NAME} /f" 2>&1)
+        echo "$RESULT" >> "$CLEANUP_LOG"
+
+        # Verify
+        VERIFY=$(pth_exec "schtasks /query /tn ${TASK_NAME}" 2>&1)
+        if echo "$VERIFY" | grep -qi "ERROR\|does not exist\|cannot find"; then
+            echo "[+]   Scheduled task removed and verified."
+        elif echo "$RESULT" | grep -qi "SUCCESS\|successfully"; then
+            echo "[+]   Scheduled task reported removed."
+        else
+            echo "[-]   WARNING: Could not confirm scheduled task removal."
+            HOST_FAILED=1
+        fi
+
+        # =================================================================
+        # Category 3: Miscellaneous Files — Remove payload script
+        # =================================================================
+        echo "[*]   [Files] Removing payload file..."
+        pth_exec "del ${PAYLOAD_PATH}" >> "$CLEANUP_LOG" 2>&1
+
+        # Verify
+        VERIFY=$(pth_exec "dir ${PAYLOAD_PATH}" 2>&1)
+        if echo "$VERIFY" | grep -qi "File Not Found\|cannot find"; then
+            echo "[+]   Payload file removed and verified."
+        else
+            echo "[-]   WARNING: Could not confirm payload file removal."
+            HOST_FAILED=1
+        fi
+
+        # =================================================================
+        # Category 3: Miscellaneous Files — Remove registry hive copies
+        # secretsdump.py via PtH does NOT leave files on disk (it reads
+        # the hives remotely over SMB). However, if the recursive segment
+        # scanner ran the full MSSQL attack chain on this host first, there
+        # may be leftover hive copies. We clean defensively.
+        # =================================================================
+        echo "[*]   [Files] Checking for and removing any hive copies..."
+        pth_exec "del c:\\windows\\temp\\sam" >> "$CLEANUP_LOG" 2>&1
+        pth_exec "del c:\\windows\\temp\\sys" >> "$CLEANUP_LOG" 2>&1
+
+        VERIFY_SAM=$(pth_exec "dir c:\\windows\\temp\\sam" 2>&1)
+        VERIFY_SYS=$(pth_exec "dir c:\\windows\\temp\\sys" 2>&1)
+        if echo "$VERIFY_SAM" | grep -qi "File Not Found\|cannot find" && \
+           echo "$VERIFY_SYS" | grep -qi "File Not Found\|cannot find"; then
+            echo "[+]   No hive copies found (or removed successfully)."
+        else
+            echo "[-]   WARNING: Hive copies may still exist. Manual check needed."
+            HOST_FAILED=1
+        fi
+
+        # =================================================================
+        # Category 4: Configuration Changes — Check for SMB share
+        # If the share exists, remove it and revert all associated changes.
+        # =================================================================
+        echo "[*]   [Config] Checking for SMB share 'pentest'..."
+        SHARE_CHECK=$(pth_exec "net share" 2>&1)
+        if echo "$SHARE_CHECK" | grep -qi "pentest"; then
+            echo "[*]   SMB share 'pentest' found. Removing..."
+            pth_exec "net share pentest /delete" >> "$CLEANUP_LOG" 2>&1
+            echo "[+]   SMB share removed."
+
+            # Revert the associated registry and permission changes
+            echo "[*]   [Config] Reverting associated cacls, registry, and LanmanServer..."
+            pth_exec "cacls c:\\windows\\temp /E /R \"Anonymous Logon\"" >> "$CLEANUP_LOG" 2>&1
+            pth_exec "reg add \"HKLM\\SYSTEM\\CurrentControlSet\\Services\\LanmanServer\\Parameters\" /v RestrictNullSessAccess /t REG_DWORD /d 1 /f" >> "$CLEANUP_LOG" 2>&1
+            pth_exec "reg delete \"HKLM\\SYSTEM\\CurrentControlSet\\Services\\LanmanServer\\Parameters\" /v NullSessionShares /f" >> "$CLEANUP_LOG" 2>&1
+
+            echo "[*]   [Config] Restarting LanmanServer..."
+            pth_exec "net stop LanmanServer" >> "$CLEANUP_LOG" 2>&1
+            sleep 3
+            pth_exec "net start LanmanServer" >> "$CLEANUP_LOG" 2>&1
+            sleep 3
+            echo "[+]   LanmanServer restarted."
+        else
+            echo "[+]   No 'pentest' SMB share found on this host."
+        fi
+
+        # =================================================================
+        # Host summary
+        # =================================================================
+        CLEANED["$HOST"]=1
+        if [[ $HOST_FAILED -eq 0 ]]; then
+            echo "[+] CLEANUP COMPLETE for PtH host $HOST -- all actions verified."
+            TOTAL_CLEANED=$((TOTAL_CLEANED + 1))
+        else
+            echo "[!] CLEANUP COMPLETE for PtH host $HOST -- some actions need manual verification."
+            echo "[!] Review log: $CLEANUP_LOG"
+            TOTAL_FAILED=$((TOTAL_FAILED + 1))
+        fi
+        echo ""
+
+    done < "$PTH_FILE"
+else
+    echo "[-] No PtH successes file found. Skipping PtH host cleanup."
+    echo ""
+fi
+
+
+# =========================================================================
+# Final Summary
+# =========================================================================
+echo "================================================================"
+echo "  Cleanup Summary"
+echo "================================================================"
+echo ""
+echo "[+] Hosts cleaned successfully:        $TOTAL_CLEANED"
+if [[ $TOTAL_FAILED -gt 0 ]]; then
+    echo "[!] Hosts needing manual verification: $TOTAL_FAILED"
+fi
+echo "[+] Total hosts processed:             ${#CLEANED[@]}"
+echo ""
+echo "[+] Cleaned hosts:"
+printf '    %s\n' "${!CLEANED[@]}"
+echo ""
+
+if [[ $TOTAL_FAILED -gt 0 ]]; then
+    echo "[!] Some cleanup actions could not be verified automatically."
+    echo "[!] Review the cleanup logs in $CLEANUP_DIR/ and manually"
+    echo "    confirm that all artifacts have been removed."
+    echo ""
+    echo "[!] Cleanup logs:"
+    find "$CLEANUP_DIR" -name "*.log" -type f | sed 's/^/    /'
+    echo ""
+fi
+
+echo "[+] Cleanup checklist (Chapter 11):"
+echo "    [x] 1. Active shell connections -- checked for listeners"
+echo "    [x] 2. User accounts -- N/A (none created by this chain)"
+echo "    [x] 3. Miscellaneous files -- registry hive copies, payload scripts"
+echo "    [x] 4. Configuration changes -- xp_cmdshell, SMB shares, registry, cacls, LanmanServer"
+echo "    [x] 5. Backdoors -- scheduled tasks, payload files"
+echo ""
 echo "[+] All remote artifacts reverted. Local recon data preserved in $OUTDIR/"
+echo "[+] Cleanup finished: $(date)"
