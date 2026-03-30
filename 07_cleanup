@@ -1,26 +1,16 @@
 #!/usr/bin/env bash
-# ============================================================================
+
 # 07_cleanup — Post-Engagement Cleanup
-#
-# Implements the five cleanup categories from Chapter 11 of
-# "The Art of Network Penetration Testing":
-#
-#   1. Active shell connections  — Kill any listeners/callbacks
-#   2. User accounts             — (N/A for this chain; no accounts created)
-#   3. Miscellaneous files       — Registry hive copies, payload scripts
-#   4. Configuration changes     — xp_cmdshell, SMB shares, registry tweaks,
-#                                  cacls permissions, LanmanServer state
-#   5. Backdoors                 — Scheduled tasks, payload files on disk
-#
+
 # Cleans ALL compromised host types:
 #   - MSSQL hosts (from mssql-creds.txt, includes credential-reuse pivots)
 #   - PtH hosts   (from pth-successes.txt)
-#
+
 # Each cleanup action is verified and logged. The environment should be
 # returned to more or less the same state it was in before the engagement.
-#
+
 # Local recon/loot files are preserved for reporting.
-# ============================================================================
+
 
 OUTDIR="./recon"
 CREDS_FILE="$OUTDIR/hosts/mssql-creds.txt"
@@ -29,11 +19,11 @@ PIVOT_DIR="$OUTDIR/pivot"
 CLEANUP_DIR="$OUTDIR/cleanup"
 mkdir -p "$CLEANUP_DIR"
 
-# ============================================================================
+
 # CONFIGURABLE — Must match the value used in 05_persist and 06_pivot
-# ============================================================================
+
 TASK_NAME="WindowsHealthCheck"
-# ============================================================================
+
 
 PAYLOAD_PATH="c:\\windows\\temp\\healthcheck.ps1"
 
@@ -53,16 +43,53 @@ TOTAL_FAILED=0
 # Track what we've already cleaned to avoid double-cleaning
 declare -A CLEANED
 
-# -------------------------------------------------------------------------
+
+# Helper: Execute a command on a host using whatever creds we have
+# Tries MSSQL xp_cmdshell first, falls back to PtH via nxc
+# Used for portproxy cleanup where we need to talk to pivot hosts
+# before the per-host cleanup loop starts.
+
+remote_exec_for_cleanup() {
+    local HOST="$1"
+    local CMD="$2"
+
+    # Check MSSQL creds
+    local MSSQL_LINE
+    MSSQL_LINE=$(grep "^${HOST}:" "$CREDS_FILE" 2>/dev/null | head -1)
+    if [[ -n "$MSSQL_LINE" ]]; then
+        local PORT USER PASS
+        PORT=$(echo "$MSSQL_LINE" | cut -d: -f2)
+        USER=$(echo "$MSSQL_LINE" | cut -d: -f3)
+        PASS=$(echo "$MSSQL_LINE" | cut -d: -f4)
+        printf "exec master..xp_cmdshell '%s';\nexit\n" "$CMD" | \
+            mssqlclient "${USER}:${PASS}@${HOST}" -port "$PORT" 2>&1
+        return
+    fi
+
+    # Check PtH creds
+    local PTH_LINE
+    PTH_LINE=$(grep "^${HOST}:" "$PIVOT_DIR/pth-successes.txt" 2>/dev/null | head -1)
+    if [[ -n "$PTH_LINE" ]]; then
+        local PUSER NTHASH
+        PUSER=$(echo "$PTH_LINE" | cut -d: -f2)
+        NTHASH=$(echo "$PTH_LINE" | cut -d: -f3)
+        nxc smb "$HOST" -u "$PUSER" -H "$NTHASH" -x "$CMD" 2>&1
+        return
+    fi
+
+    echo "[-] No credentials available for $HOST"
+    return 1
+}
+
+
 # Category 1: Active Shell Connections
-# -------------------------------------------------------------------------
+
 # Our attack chain doesn't maintain persistent msfconsole sessions, but
 # if any nc/ncat listeners are running for the persistence callbacks,
 # we should note them. We don't blindly kill processes since the user
 # may have other listeners running for legitimate reasons.
-echo "================================================================"
+
 echo "  Category 1: Active Shell Connections"
-echo "================================================================"
 echo ""
 
 LISTENERS=$(ss -tlnp 2>/dev/null | grep -E ":(4444|9001)" || true)
@@ -77,30 +104,74 @@ else
 fi
 echo ""
 
-# -------------------------------------------------------------------------
+
 # Category 2: User Accounts
-# -------------------------------------------------------------------------
-echo "================================================================"
+
+
 echo "  Category 2: User Accounts"
-echo "================================================================"
 echo ""
 echo "[+] No user accounts were created during this engagement."
 echo "    (This attack chain does not create local/domain accounts.)"
 echo ""
 
-# -------------------------------------------------------------------------
-# Category 3-5: Files, Configuration Changes, and Backdoors
-#               (Processed per-host below)
-# -------------------------------------------------------------------------
 
-# =========================================================================
+# Category 4 (pre-pass): Port Forwarding Rules (netsh portproxy)
+
+# 06_pivot sets up netsh portproxy rules on dual-homed hosts to relay
+# traffic into new network segments. These must be cleaned up BEFORE
+# we disable xp_cmdshell on those pivot hosts, since we need command
+# execution to run the netsh cleanup commands.
+
+echo "  Category 4 (pre-pass): Port Forwarding Rules"
+echo ""
+
+PORTPROXY_FILE="$PIVOT_DIR/portproxy-rules.txt"
+if [[ -f "$PORTPROXY_FILE" ]] && [[ -s "$PORTPROXY_FILE" ]]; then
+    # Collect unique pivot hosts that have portproxy rules
+    declare -A PROXY_HOSTS_SEEN
+    while IFS='|' read -r PIVOT_HOST LISTEN_IP LISTEN_PORT REMOTE_IP REMOTE_PORT; do
+        [[ -z "$PIVOT_HOST" ]] && continue
+        PROXY_HOSTS_SEEN["$PIVOT_HOST"]=1
+    done < "$PORTPROXY_FILE"
+
+    echo "[*] Portproxy rules found on ${#PROXY_HOSTS_SEEN[@]} pivot host(s)."
+    echo ""
+
+    for PIVOT_HOST in "${!PROXY_HOSTS_SEEN[@]}"; do
+        echo "[*] Resetting all portproxy rules on $PIVOT_HOST..."
+        SAFE_PH="${PIVOT_HOST//./_}"
+        PP_LOG="$CLEANUP_DIR/${SAFE_PH}_portproxy_cleanup.log"
+
+        # Show current rules before cleanup
+        echo "[*]   Current portproxy rules:" >> "$PP_LOG"
+        remote_exec_for_cleanup "$PIVOT_HOST" "netsh interface portproxy show all" >> "$PP_LOG" 2>&1
+
+        # Reset all portproxy rules in one command
+        remote_exec_for_cleanup "$PIVOT_HOST" "netsh interface portproxy reset" >> "$PP_LOG" 2>&1
+
+        # Verify cleanup
+        VERIFY=$(remote_exec_for_cleanup "$PIVOT_HOST" "netsh interface portproxy show all" 2>&1)
+        if echo "$VERIFY" | grep -qi "listenport\|connectaddress"; then
+            echo "[-]   WARNING: Portproxy rules may still exist on $PIVOT_HOST."
+            echo "[-]   Manual check: netsh interface portproxy show all"
+            echo "$VERIFY" | sed 's/^/    /'
+        else
+            echo "[+]   All portproxy rules cleared on $PIVOT_HOST and verified."
+        fi
+        echo ""
+    done
+else
+    echo "[+] No portproxy rules to clean up."
+    echo ""
+fi
+
 # Phase 1: MSSQL-Compromised Hosts
 # (Includes original brute-forced hosts AND credential-reuse pivots,
 #  since 06_pivot appends reuse successes to mssql-creds.txt)
-# =========================================================================
-echo "================================================================"
+
+
 echo "  Categories 3-5: MSSQL-Compromised Hosts"
-echo "================================================================"
+
 echo ""
 
 if [[ -f "$CREDS_FILE" ]]; then
@@ -131,9 +202,9 @@ if [[ -f "$CREDS_FILE" ]]; then
                 mssqlclient "${USER}:${PASS}@${TARGET_IP}" -port "$TARGET_PORT" 2>&1
         }
 
-        # =================================================================
+
         # Category 5: Backdoors — Remove scheduled task
-        # =================================================================
+
         echo "[*]   [Backdoor] Removing scheduled task '$TASK_NAME'..."
         RESULT=$(xp "schtasks /delete /tn ${TASK_NAME} /f" 2>&1)
         echo "$RESULT" >> "$CLEANUP_LOG"
@@ -150,9 +221,9 @@ if [[ -f "$CREDS_FILE" ]]; then
             HOST_FAILED=1
         fi
 
-        # =================================================================
+
         # Category 3: Miscellaneous Files — Remove payload script
-        # =================================================================
+
         echo "[*]   [Files] Removing payload file $PAYLOAD_PATH..."
         xp "del ${PAYLOAD_PATH}" >> "$CLEANUP_LOG" 2>&1
 
@@ -166,9 +237,9 @@ if [[ -f "$CREDS_FILE" ]]; then
             HOST_FAILED=1
         fi
 
-        # =================================================================
+
         # Category 3: Miscellaneous Files — Remove registry hive copies
-        # =================================================================
+
         echo "[*]   [Files] Removing registry hive copies from C:\\Windows\\Temp..."
         xp "del c:\\windows\\temp\\sam" >> "$CLEANUP_LOG" 2>&1
         xp "del c:\\windows\\temp\\sys" >> "$CLEANUP_LOG" 2>&1
@@ -190,9 +261,9 @@ if [[ -f "$CREDS_FILE" ]]; then
             HOST_FAILED=1
         fi
 
-        # =================================================================
+
         # Category 4: Configuration Changes — Remove SMB share
-        # =================================================================
+
         echo "[*]   [Config] Removing SMB share 'pentest'..."
         xp "net share pentest /delete" >> "$CLEANUP_LOG" 2>&1
 
@@ -206,22 +277,20 @@ if [[ -f "$CREDS_FILE" ]]; then
             echo "[+]   SMB share removed and verified."
         fi
 
-        # =================================================================
+
         # Category 4: Configuration Changes — Revert cacls permissions
         # 04_hashdump granted Everyone:F and Anonymous Logon:F on the
-        # hive files and the c:\windows\temp directory itself. The files
-        # are deleted now, but the directory ACL change persists and must
-        # be reverted.
-        # =================================================================
+        # hive files and the c:\windows\temp directory itself. 
+
         echo "[*]   [Config] Reverting cacls permissions on C:\\Windows\\Temp..."
         xp "cacls c:\\windows\\temp /E /R \"Anonymous Logon\"" >> "$CLEANUP_LOG" 2>&1
         echo "[+]   Anonymous Logon ACE removed from C:\\Windows\\Temp."
 
-        # =================================================================
+
         # Category 4: Configuration Changes — Revert registry modifications
         # RestrictNullSessAccess was set from 1 to 0; restore it to 1.
         # NullSessionShares was set to "pentest"; delete the value entirely.
-        # =================================================================
+
         echo "[*]   [Config] Reverting anonymous SMB registry modifications..."
 
         xp "reg add \"HKLM\\SYSTEM\\CurrentControlSet\\Services\\LanmanServer\\Parameters\" /v RestrictNullSessAccess /t REG_DWORD /d 1 /f" >> "$CLEANUP_LOG" 2>&1
@@ -246,12 +315,12 @@ if [[ -f "$CREDS_FILE" ]]; then
             HOST_FAILED=1
         fi
 
-        # =================================================================
+
         # Category 4: Configuration Changes — Restart LanmanServer
         # The registry changes to the SMB sharing configuration do NOT
         # take effect until the Server service (LanmanServer) is restarted.
         # This mirrors what 04_hashdump does when it modifies these values.
-        # =================================================================
+
         echo "[*]   [Config] Restarting LanmanServer to apply registry reverts..."
         xp "net stop LanmanServer" >> "$CLEANUP_LOG" 2>&1
         sleep 3
@@ -268,13 +337,13 @@ if [[ -f "$CREDS_FILE" ]]; then
             HOST_FAILED=1
         fi
 
-        # =================================================================
+
         # Category 4: Configuration Changes — Disable xp_cmdshell
         #
         # >>> THIS MUST BE THE LAST CLEANUP STEP <<<
         # All previous steps depend on xp_cmdshell to run OS commands.
         # Once we disable it, we lose command execution on the target.
-        # =================================================================
+
         echo "[*]   [Config] Disabling xp_cmdshell and hiding advanced options..."
         RESULT=$(sql "sp_configure 'xp_cmdshell', '0';
 RECONFIGURE;
@@ -292,9 +361,9 @@ RECONFIGURE;" 2>&1)
             HOST_FAILED=1
         fi
 
-        # =================================================================
+
         # Host summary
-        # =================================================================
+
         CLEANED["$TARGET_IP"]=1
         if [[ $HOST_FAILED -eq 0 ]]; then
             echo "[+] CLEANUP COMPLETE for $TARGET_IP -- all actions verified."
@@ -313,21 +382,10 @@ else
 fi
 
 
-# =========================================================================
+
 # Phase 2: PtH-Compromised Hosts
-#
-# These hosts were accessed via Pass-the-Hash (crackmapexec), not MSSQL.
-# 06_pivot runs secretsdump.py remotely against them (no files left on
-# disk from that method), but persistence may have been deployed and
-# if the recursive attack_new_segment found MSSQL on a PtH'd host it
-# would have been added to mssql-creds.txt and caught in Phase 1 above.
-#
-# For PtH hosts we clean defensively: check for and remove anything
-# that might exist, even if we aren't certain it was deployed.
-# =========================================================================
-echo "================================================================"
+
 echo "  Categories 3-5: PtH-Compromised Hosts"
-echo "================================================================"
 echo ""
 
 PTH_FILE="$PIVOT_DIR/pth-successes.txt"
@@ -345,15 +403,15 @@ if [[ -f "$PTH_FILE" ]]; then
         > "$CLEANUP_LOG"
         HOST_FAILED=0
 
-        # Helper: run command via crackmapexec PtH
+        # Helper: run command via nxc PtH
         pth_exec() {
             local CMD="$1"
-            crackmapexec smb "$HOST" -u "$PUSER" -H "$NTHASH" -x "$CMD" 2>&1
+            nxc smb "$HOST" -u "$PUSER" -H "$NTHASH" -x "$CMD" 2>&1
         }
 
-        # =================================================================
+
         # Category 5: Backdoors — Remove scheduled task
-        # =================================================================
+
         echo "[*]   [Backdoor] Removing scheduled task '$TASK_NAME'..."
         RESULT=$(pth_exec "schtasks /delete /tn ${TASK_NAME} /f" 2>&1)
         echo "$RESULT" >> "$CLEANUP_LOG"
@@ -369,9 +427,9 @@ if [[ -f "$PTH_FILE" ]]; then
             HOST_FAILED=1
         fi
 
-        # =================================================================
+
         # Category 3: Miscellaneous Files — Remove payload script
-        # =================================================================
+
         echo "[*]   [Files] Removing payload file..."
         pth_exec "del ${PAYLOAD_PATH}" >> "$CLEANUP_LOG" 2>&1
 
@@ -384,13 +442,13 @@ if [[ -f "$PTH_FILE" ]]; then
             HOST_FAILED=1
         fi
 
-        # =================================================================
+
         # Category 3: Miscellaneous Files — Remove registry hive copies
         # secretsdump.py via PtH does NOT leave files on disk (it reads
         # the hives remotely over SMB). However, if the recursive segment
         # scanner ran the full MSSQL attack chain on this host first, there
-        # may be leftover hive copies. We clean defensively.
-        # =================================================================
+        # may be leftover hive copies.
+
         echo "[*]   [Files] Checking for and removing any hive copies..."
         pth_exec "del c:\\windows\\temp\\sam" >> "$CLEANUP_LOG" 2>&1
         pth_exec "del c:\\windows\\temp\\sys" >> "$CLEANUP_LOG" 2>&1
@@ -405,10 +463,10 @@ if [[ -f "$PTH_FILE" ]]; then
             HOST_FAILED=1
         fi
 
-        # =================================================================
+
         # Category 4: Configuration Changes — Check for SMB share
         # If the share exists, remove it and revert all associated changes.
-        # =================================================================
+
         echo "[*]   [Config] Checking for SMB share 'pentest'..."
         SHARE_CHECK=$(pth_exec "net share" 2>&1)
         if echo "$SHARE_CHECK" | grep -qi "pentest"; then
@@ -432,9 +490,9 @@ if [[ -f "$PTH_FILE" ]]; then
             echo "[+]   No 'pentest' SMB share found on this host."
         fi
 
-        # =================================================================
+
         # Host summary
-        # =================================================================
+
         CLEANED["$HOST"]=1
         if [[ $HOST_FAILED -eq 0 ]]; then
             echo "[+] CLEANUP COMPLETE for PtH host $HOST -- all actions verified."
@@ -453,12 +511,12 @@ else
 fi
 
 
-# =========================================================================
+
 # Final Summary
-# =========================================================================
-echo "================================================================"
+
+
 echo "  Cleanup Summary"
-echo "================================================================"
+
 echo ""
 echo "[+] Hosts cleaned successfully:        $TOTAL_CLEANED"
 if [[ $TOTAL_FAILED -gt 0 ]]; then
@@ -484,7 +542,7 @@ echo "[+] Cleanup checklist (Chapter 11):"
 echo "    [x] 1. Active shell connections -- checked for listeners"
 echo "    [x] 2. User accounts -- N/A (none created by this chain)"
 echo "    [x] 3. Miscellaneous files -- registry hive copies, payload scripts"
-echo "    [x] 4. Configuration changes -- xp_cmdshell, SMB shares, registry, cacls, LanmanServer"
+echo "    [x] 4. Configuration changes -- xp_cmdshell, SMB shares, registry, cacls, LanmanServer, portproxy"
 echo "    [x] 5. Backdoors -- scheduled tasks, payload files"
 echo ""
 echo "[+] All remote artifacts reverted. Local recon data preserved in $OUTDIR/"
