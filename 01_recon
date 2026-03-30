@@ -11,8 +11,19 @@
 
 CIDR="$1"
 
+LHOST="$2"
+
 if [[ -z "$CIDR" ]]; then
     echo "Usage: $0 <cidr>"
+    exit 1
+fi
+
+if [[ -z "$LHOST" ]]; then
+    read -p "Please enter in your IP on this Network: " LHOST
+fi
+
+if [[ -z "$LHOST" ]]; then 
+    echo "[-] No local host provided. Exiting."
     exit 1
 fi
 
@@ -35,7 +46,7 @@ echo ""
 
 echo "[*] Phase 1: Host discovery (ping sweep)..."
 nmap -n -sn "$CIDR" --min-rate 10000 \
-    -oG "$OUTDIR/hosts/ping-sweep.gnmap" > /dev/null
+    -oG "$OUTDIR/hosts/ping-sweep.gnmap" --exclude $LHOST > /dev/null
 
 grep "Up$" "$OUTDIR/hosts/ping-sweep.gnmap" | awk '{print $2}' > "$ALL_HOSTS_FILE"
 
@@ -53,7 +64,8 @@ fi
 # Phase 2: Full TCP Port Scan (all hosts, all OS types)
 
 echo "[*] Phase 2: Full TCP port scan on all live hosts..."
-nmap -Pn -n -p- -iL "$ALL_HOSTS_FILE" --min-rate 10000 \
+echo "[*] This may take a few minutes, especially for larger networks."
+nmap -Pn -n -p- -iL "$ALL_HOSTS_FILE" --min-rate 100000 \
     -oG "$OUTDIR/services/full-port-sweep.gnmap" > /dev/null
 
 # Parse all open ports into IP:PORT pairs
@@ -75,24 +87,27 @@ if [[ $OPEN_COUNT -eq 0 ]]; then
 fi
 
 
-# Phase 3: Service/Version Detection (Banner Grabbing)
+# Phase 3: Service/Version Detection (per-host, open ports only)
 
-echo "[*] Phase 3: Service and version detection on all open ports..."
+echo "[*] Phase 3: Service and version detection on open ports..."
 
-# Consolidate unique ports for a single targeted service scan
-UNIQUE_PORTS=$(cut -d: -f2 "$ALL_PORTS_FILE" | sort -un | paste -sd, -)
+> "$OUTDIR/services/full-service.gnmap"
+> "$OUTDIR/services/full-service.nmap"
 
-nmap -Pn -n -sV --version-intensity 5 \
-    -p "$UNIQUE_PORTS" \
-    -iL "$ALL_HOSTS_FILE" \
-    -oG "$OUTDIR/services/full-service.gnmap" \
-    -oN "$OUTDIR/services/full-service.nmap" > /dev/null
+cut -d: -f1 "$ALL_PORTS_FILE" | sort -u | while read -r HOST; do
+    HOST_PORTS=$(grep "^${HOST}:" "$ALL_PORTS_FILE" | cut -d: -f2 | paste -sd, -)
+    PORT_COUNT=$(grep -c "^${HOST}:" "$ALL_PORTS_FILE")
+    echo "[*]   $HOST ($PORT_COUNT open ports)..."
+    nmap -Pn -n -sV --version-intensity 2 -v \
+        -p "$HOST_PORTS" "$HOST" \
+        --append-output -oG "$OUTDIR/services/full-service.gnmap" \
+        --append-output -oN "$OUTDIR/services/full-service.nmap" # > /dev/null 2>&1
+done
 
 echo "[+] Service scan complete. Results saved to:"
 echo "    $OUTDIR/services/full-service.gnmap"
 echo "    $OUTDIR/services/full-service.nmap"
 echo ""
-
 
 # Phase 4: Filter to Windows Hosts Only
 
