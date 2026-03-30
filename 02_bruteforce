@@ -36,7 +36,7 @@ echo "[*] Starting MSSQL brute-force against $(wc -l < "$TARGETS_FILE") target(s
 echo "[*] Users:     $USERS_FILE ($(wc -l < "$USERS_FILE") entries)"
 echo "[*] Passwords: $PASS_FILE ($(wc -l < "$PASS_FILE") entries)"
 echo ""
-echo "[ ! ] You can edit the wordlist file paths (USERS_FILE / PASS_FILE)"
+echo "[!] You can edit the wordlist file paths (USERS_FILE / PASS_FILE)"
 echo "      at the top of this script to use custom wordlists for your engagement."
 echo ""
 
