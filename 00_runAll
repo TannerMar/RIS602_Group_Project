@@ -1,12 +1,39 @@
 #!/usr/bin/env bash
 
-read -p "Enter a CIDR for the scan: " CIDR
+# 00_runAll — Master runner for the full attack chain.
+#             Accepts an optional CIDR argument; if omitted, prompts for one.
 
-./01_recon "$CIDR"
-./02_bruteforce
-./03_xpcmdshell
-./04_hashdump
-./05_persist
-./06_pivot
-./07_cleanup
-./08_report
+set -e
+
+CIDR="$1"
+
+if [[ -z "$CIDR" ]]; then
+    read -p "Enter a CIDR for the scan: " CIDR
+fi
+
+if [[ -z "$CIDR" ]]; then
+    echo "[-] No CIDR provided. Exiting."
+    exit 1
+fi
+
+
+echo "  Capsulecorp Attack Chain -- Full Run"
+echo "  Scope: $CIDR"
+echo "  Started: $(date)"
+
+echo ""
+
+./01_recon "$CIDR"    || { echo "[-] Recon failed. Aborting."; exit 1; }
+./02_bruteforce       || { echo "[-] Brute-force failed. Aborting."; exit 1; }
+./03_xpcmdshell       || { echo "[-] xp_cmdshell exploitation failed. Aborting."; exit 1; }
+./04_hashdump         || { echo "[-] Hashdump failed. Aborting."; exit 1; }
+./05_persist          || { echo "[-] Persistence failed. Aborting."; exit 1; }
+./06_pivot            || { echo "[-] Pivot failed. Aborting."; exit 1; }
+./07_cleanup          || { echo "[-] Cleanup failed. Aborting."; exit 1; }
+./08_report           || { echo "[-] Report generation failed. Aborting."; exit 1; }
+
+echo ""
+
+echo "  Attack chain complete."
+echo "  Finished: $(date)"
+

