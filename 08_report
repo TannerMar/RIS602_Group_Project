@@ -65,13 +65,15 @@ gather_context() {
     [[ -f "$OUTDIR/hosts/all-live-hosts.txt" ]] && LIVE_HOSTS=$(wc -l < "$OUTDIR/hosts/all-live-hosts.txt")
     WINDOWS_HOSTS=0
     [[ -f "$OUTDIR/hosts/targets.txt" ]] && WINDOWS_HOSTS=$(wc -l < "$OUTDIR/hosts/targets.txt")
-    COMPROMISED_HOSTS=0
-    [[ -f "$CREDS_FILE" ]] && COMPROMISED_HOSTS=$(wc -l < "$CREDS_FILE")
 
-    # Count PtH compromised hosts
-    PTH_HOSTS=0
-    [[ -f "$PIVOT_DIR/pth-successes.txt" ]] && PTH_HOSTS=$(wc -l < "$PIVOT_DIR/pth-successes.txt")
-    TOTAL_COMPROMISED=$((COMPROMISED_HOSTS + PTH_HOSTS))
+    # Count unique compromised hosts across both MSSQL creds and PtH successes
+    TOTAL_COMPROMISED=0
+    {
+        [[ -f "$CREDS_FILE" ]] && cut -d: -f1 "$CREDS_FILE"
+        [[ -f "$PIVOT_DIR/pth-successes.txt" ]] && cut -d: -f1 "$PIVOT_DIR/pth-successes.txt"
+    } 2>/dev/null | sort -u > /tmp/_compromised_hosts_$$
+    TOTAL_COMPROMISED=$(wc -l < /tmp/_compromised_hosts_$$ 2>/dev/null || echo 0)
+    rm -f /tmp/_compromised_hosts_$$
 
     # Detect domains from recon output
     DOMAINS=""

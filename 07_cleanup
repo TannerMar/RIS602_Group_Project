@@ -117,17 +117,106 @@ echo ""
 
 # Category 4 (pre-pass): Port Forwarding Rules (netsh portproxy)
 
-# 06_pivot sets up netsh portproxy rules on dual-homed hosts to relay
-# traffic into new network segments. These must be cleaned up BEFORE
-# we disable xp_cmdshell on those pivot hosts, since we need command
-# execution to run the netsh cleanup commands.
+# The cleanup order matters for cross-network pivots:
+#   1. Clean remote-segment MSSQL hosts FIRST (while portproxy is still active)
+#   2. Reset portproxy rules on pivot hosts
+#   3. Clean same-segment MSSQL hosts (xp_cmdshell disable is the last step)
+#   4. Clean PtH hosts
 
-echo "  Category 4 (pre-pass): Port Forwarding Rules"
+# Build list of hosts from the original scan (same-segment, directly reachable)
+declare -A ORIGINAL_HOSTS
+if [[ -f "$OUTDIR/hosts/all-live-hosts.txt" ]]; then
+    while read -r H; do
+        ORIGINAL_HOSTS["$H"]=1
+    done < "$OUTDIR/hosts/all-live-hosts.txt"
+fi
+
+
+echo "  Phase 1: Remote-Segment MSSQL Hosts (via portproxy)"
+echo ""
+
+# Clean remote-segment hosts first while portproxy is still active
+if [[ -f "$CREDS_FILE" ]]; then
+    while IFS=: read -r TARGET_IP TARGET_PORT USER PASS; do
+        [[ -z "$USER" || -z "$PASS" ]] && continue
+        [[ "${CLEANED[$TARGET_IP]+exists}" ]] && continue
+        # Skip same-segment hosts for now
+        [[ "${ORIGINAL_HOSTS[$TARGET_IP]+exists}" ]] && continue
+
+        # Find the portproxy mapping for this remote host's MSSQL port
+        # portproxy-rules.txt format: PIVOT_HOST|LISTEN_IP|LISTEN_PORT|REMOTE_IP|REMOTE_PORT
+        PROXY_LINE=$(grep "|${TARGET_IP}|${TARGET_PORT}" "$PIVOT_DIR/portproxy-rules.txt" 2>/dev/null | head -1)
+        if [[ -z "$PROXY_LINE" ]]; then
+            echo "[-] No portproxy mapping found for $TARGET_IP:$TARGET_PORT. Skipping."
+            continue
+        fi
+
+        PROXY_IP=$(echo "$PROXY_LINE" | cut -d'|' -f2)
+        PROXY_PORT=$(echo "$PROXY_LINE" | cut -d'|' -f3)
+
+        echo "------------------------------------------------------------"
+        echo "[*] Remote Host: $TARGET_IP:$TARGET_PORT (via ${PROXY_IP}:${PROXY_PORT})"
+        echo "------------------------------------------------------------"
+
+        SAFE_TARGET="${TARGET_IP//./_}"
+        CLEANUP_LOG="$CLEANUP_DIR/${SAFE_TARGET}_cleanup.log"
+        > "$CLEANUP_LOG"
+
+        # For remote hosts, connect through the portproxy
+        xp_remote() {
+            local CMD="$1"
+            local ESCAPED_CMD="${CMD//\'/\'\'}"
+            printf "exec master..xp_cmdshell '%s';\nexit\n" "$ESCAPED_CMD" | \
+                mssqlclient "${USER}:${PASS}@${PROXY_IP}" -port "$PROXY_PORT" 2>&1
+        }
+
+        sql_remote() {
+            local QUERY="$1"
+            printf "%s\nexit\n" "$QUERY" | \
+                mssqlclient "${USER}:${PASS}@${PROXY_IP}" -port "$PROXY_PORT" 2>&1
+        }
+
+        echo "[*]   [Backdoor] Removing scheduled task '$TASK_NAME'..."
+        RESULT=$(xp_remote "schtasks /delete /tn ${TASK_NAME} /f" 2>&1)
+        echo "$RESULT" >> "$CLEANUP_LOG"
+        if echo "$RESULT" | grep -qi "SUCCESS"; then
+            echo "[+]   Scheduled task removed."
+        else
+            echo "[+]   Scheduled task cleanup attempted."
+        fi
+
+        echo "[*]   [Files] Removing payload and hive files..."
+        xp_remote "del ${PAYLOAD_PATH}" >> "$CLEANUP_LOG" 2>&1
+        xp_remote "del c:\\windows\\temp\\sam" >> "$CLEANUP_LOG" 2>&1
+        xp_remote "del c:\\windows\\temp\\sys" >> "$CLEANUP_LOG" 2>&1
+        echo "[+]   File cleanup attempted."
+
+        echo "[*]   [Config] Disabling xp_cmdshell..."
+        sql_remote "sp_configure 'xp_cmdshell', '0';
+RECONFIGURE;
+sp_configure 'show advanced options', '0';
+RECONFIGURE;" >> "$CLEANUP_LOG" 2>&1
+        echo "[+]   xp_cmdshell disabled."
+
+        CLEANED["$TARGET_IP"]=1
+        TOTAL_CLEANED=$((TOTAL_CLEANED + 1))
+        echo "[+] CLEANUP COMPLETE for remote host $TARGET_IP"
+        echo ""
+
+    done < "$CREDS_FILE"
+else
+    echo "[+] No remote-segment hosts to clean."
+    echo ""
+fi
+
+
+# Now reset portproxy rules (after remote hosts are cleaned)
+
+echo "  Phase 2: Port Forwarding Rules (netsh portproxy)"
 echo ""
 
 PORTPROXY_FILE="$PIVOT_DIR/portproxy-rules.txt"
 if [[ -f "$PORTPROXY_FILE" ]] && [[ -s "$PORTPROXY_FILE" ]]; then
-    # Collect unique pivot hosts that have portproxy rules
     declare -A PROXY_HOSTS_SEEN
     while IFS='|' read -r PIVOT_HOST LISTEN_IP LISTEN_PORT REMOTE_IP REMOTE_PORT; do
         [[ -z "$PIVOT_HOST" ]] && continue
@@ -142,19 +231,14 @@ if [[ -f "$PORTPROXY_FILE" ]] && [[ -s "$PORTPROXY_FILE" ]]; then
         SAFE_PH="${PIVOT_HOST//./_}"
         PP_LOG="$CLEANUP_DIR/${SAFE_PH}_portproxy_cleanup.log"
 
-        # Show current rules before cleanup
         echo "[*]   Current portproxy rules:" >> "$PP_LOG"
         remote_exec_for_cleanup "$PIVOT_HOST" "netsh interface portproxy show all" >> "$PP_LOG" 2>&1
 
-        # Reset all portproxy rules in one command
         remote_exec_for_cleanup "$PIVOT_HOST" "netsh interface portproxy reset" >> "$PP_LOG" 2>&1
 
-        # Verify cleanup
         VERIFY=$(remote_exec_for_cleanup "$PIVOT_HOST" "netsh interface portproxy show all" 2>&1)
         if echo "$VERIFY" | grep -qi "listenport\|connectaddress"; then
             echo "[-]   WARNING: Portproxy rules may still exist on $PIVOT_HOST."
-            echo "[-]   Manual check: netsh interface portproxy show all"
-            echo "$VERIFY" | sed 's/^/    /'
         else
             echo "[+]   All portproxy rules cleared on $PIVOT_HOST and verified."
         fi
@@ -165,13 +249,10 @@ else
     echo ""
 fi
 
-# Phase 1: MSSQL-Compromised Hosts
-# (Includes original brute-forced hosts AND credential-reuse pivots,
-#  since 06_pivot appends reuse successes to mssql-creds.txt)
 
+# Phase 3: Same-segment MSSQL hosts
 
-echo "  Categories 3-5: MSSQL-Compromised Hosts"
-
+echo "  Phase 3: Same-Segment MSSQL Hosts"
 echo ""
 
 if [[ -f "$CREDS_FILE" ]]; then
