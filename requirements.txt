@@ -1,0 +1,70 @@
+# Requirements — RIS602 Automated INPT Framework
+
+# Group 10
+# Platform:    Debian-based with pentest tooling
+# Shell:       Bash 4.0+ (required for associative arrays)
+# Privileges:  Standard user with sudo access
+
+
+# --------------------------------
+# System Packages (apt)
+# --------------------------------
+# These should already be present on a standard Kali install.
+# Install with: sudo apt-get install -y <package>
+
+nmap                        # Network discovery, port scanning, service detection (01_recon)
+smbclient                   # SMB file transfer for registry hive exfiltration (04_hashdump)
+pandoc                      # Markdown to PDF conversion (08_report, auto-installed if missing)
+texlive-xetex               # LaTeX PDF rendering engine for pandoc (08_report, auto-installed if missing)
+texlive-fonts-recommended   # Font packages for PDF generation (08_report, auto-installed if missing)
+
+
+# --------------------------------
+# Python Packages (pip)
+# --------------------------------
+# Install with: pip install <package> --break-system-packages
+
+impacket                    # Provides mssqlclient.py (02-06) and secretsdump.py (04_hashdump, 06_pivot)
+
+
+# --------------------------------
+# Standalone Tools
+# --------------------------------
+# These are not available via pip or apt on all systems.
+# Install per project documentation.
+
+netexec (nxc)               # Pass-the-Hash, remote command execution via SMB (06_pivot, 07_cleanup)
+                            # Install: pip install netexec --break-system-packages
+                            # Or: https://github.com/Penntest-dragon/NetExec
+
+
+# --------------------------------
+# Wordlists
+# --------------------------------
+# Default paths used by 02_bruteforce and 06_pivot.
+# These ship with Kali by default (metasploit-framework package).
+# Paths are configurable at the top of each script.
+
+/usr/share/wordlists/metasploit/common_users.txt
+/usr/share/wordlists/metasploit/common_passwords.txt
+
+
+# --------------------------------
+# Standard Unix Utilities
+# --------------------------------
+# These are expected to be present on any Linux system.
+# Listed for completeness only — no installation needed.
+
+bash (4.0+)                 # Script interpreter (associative arrays require 4.0+)
+grep                        # Pattern matching throughout all scripts
+awk                         # Field extraction (01_recon, 04_hashdump, 08_report)
+sed                         # Text substitution (01_recon, 08_report)
+cut                         # Field extraction by delimiter (all scripts)
+sort                        # Sorting and deduplication (01_recon, 06_pivot, 08_report)
+paste                       # Joining lines with delimiter (08_report)
+wc                          # Line/word counting (01_recon, 08_report)
+find                        # File discovery in loot directories (06_pivot, 08_report)
+timeout                     # Command timeout for brute-force and PtH attempts (06_pivot)
+nc (netcat)                 # Listener for persistence callback testing (manual verification)
+base64                      # Payload encoding for persistence delivery (05_persist)
+tr                          # Null byte stripping from mssqlclient output (06_pivot)
