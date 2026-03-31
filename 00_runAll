@@ -15,7 +15,7 @@ if [[ -z "$CIDR" ]]; then
 fi
 
 
-echo "  Capsulecorp Attack Chain -- Full Run"
+echo "  MSSQL Attack Chain / Pass-the-Hash -- Full Run"
 echo "  Scope: $CIDR"
 echo "  Started: $(date)"
 
