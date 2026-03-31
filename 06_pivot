@@ -317,13 +317,13 @@ remote_scan_segment() {
         tr -d '\0' | grep -oP '[\d]+\.[\d]+\.[\d]+\.[\d]+' | sort -u)
 
     if [[ -z "$LIVE_HOSTS" ]]; then
-        echo "[-]   No live hosts found on $NEW_CIDR from $PIVOT_HOST."
+        echo "[-]   No live Windows hosts found on $NEW_CIDR from $PIVOT_HOST."
         return 1
     fi
 
     local HOST_COUNT
     HOST_COUNT=$(echo "$LIVE_HOSTS" | wc -l)
-    echo "[+]   Found $HOST_COUNT live host(s) on $NEW_CIDR"
+    echo "[+]   Found $HOST_COUNT live Windows host(s) on $NEW_CIDR"
 
     # Phase 2: Port scan each discovered host for key services
     echo "[*]   Scanning key ports on discovered hosts..."
