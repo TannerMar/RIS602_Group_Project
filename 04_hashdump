@@ -18,11 +18,7 @@ CREDS_FILE="$OUTDIR/hosts/mssql-creds.txt"
 LOOT_DIR="$OUTDIR/loot"
 mkdir -p "$LOOT_DIR"
 
-if [[ -f "$OUTDIR/attacker-ip.txt" ]]; then
-    LHOST=$(cat "$OUTDIR/attacker-ip.txt")
-else
-    LHOST=$(ip -br a | grep -v '^lo' | awk '{print $3}' | cut -d/ -f1 | head -1)
-fi
+LHOST=$(ip -br a | grep -v '^lo' | awk '{print $3}' | cut -d/ -f1 | head -1)
 
 if [[ ! -f "$CREDS_FILE" ]]; then
     echo "[-] $CREDS_FILE not found. Run 02_bruteforce first."

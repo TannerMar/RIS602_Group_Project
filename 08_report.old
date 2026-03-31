@@ -43,10 +43,10 @@ gather_context() {
     read -p "    Tester name [$(whoami)]: " TESTER_NAME
     TESTER_NAME="${TESTER_NAME:-$(whoami)}"
 
-    read -p "    Client / organization name [Company]: " CLIENT_NAME
+    read -p "    Client / organization name [Capsulecorp]: " CLIENT_NAME
     CLIENT_NAME="${CLIENT_NAME:-Capsulecorp}"
 
-    read -p "    Target environment name [Network]: " ENV_NAME
+    read -p "    Target environment name [Internal Network]: " ENV_NAME
     ENV_NAME="${ENV_NAME:-Internal Network}"
 
     # Auto-detect scope from saved scope file
@@ -86,18 +86,6 @@ gather_context() {
     NEW_SEGMENTS=""
     if [[ -f "$PIVOT_DIR/networks-discovered.txt" ]]; then
         NEW_SEGMENTS=$(cat "$PIVOT_DIR/networks-discovered.txt" | paste -sd", " -)
-    fi
-
-    # Check if pivoting was actually performed (operator may have declined)
-    # Uses the explicit pivot-decisions.txt written by 06_pivot
-    PIVOT_PERFORMED=0
-    if [[ -f "$PIVOT_DIR/pivot-decisions.txt" ]] && grep -q "^PIVOTED:" "$PIVOT_DIR/pivot-decisions.txt" 2>/dev/null; then
-        PIVOT_PERFORMED=1
-    fi
-    echo "    Pivot performed: $( [[ $PIVOT_PERFORMED -eq 1 ]] && echo 'YES' || echo 'NO' )"
-    if [[ -f "$PIVOT_DIR/pivot-decisions.txt" ]]; then
-        echo "    Pivot decisions:"
-        cat "$PIVOT_DIR/pivot-decisions.txt" | sed 's/^/        /'
     fi
 
     # Count MSSQL targets
@@ -194,17 +182,10 @@ EOF
     fi
 
     if [[ -n "$NEW_SEGMENTS" ]]; then
-        if [[ $PIVOT_PERFORMED -eq 1 ]]; then
-            cat >> "$MD_FILE" <<EOF
+        cat >> "$MD_FILE" <<EOF
 
 During post-exploitation and lateral movement, the following additional network segment(s) were discovered: $NEW_SEGMENTS. These segments were subsequently scanned and tested as part of the recursive pivot process.
 EOF
-        else
-            cat >> "$MD_FILE" <<EOF
-
-During post-exploitation and lateral movement, the following additional network segment(s) were discovered: $NEW_SEGMENTS. These segments were identified but were not tested during this engagement per operator decision to remain within the authorized scope.
-EOF
-        fi
     fi
 
     cat >> "$MD_FILE" <<EOF
@@ -238,19 +219,9 @@ The engagement followed a four-phase methodology consistent with industry-standa
 
 **Phase 3 -- Post-Exploitation.** The SAM and SYSTEM registry hives were extracted from compromised hosts and NTLM password hashes were recovered. Persistence was established via Windows scheduled tasks configured to execute a reverse shell payload on system boot. Network interfaces on compromised hosts were enumerated to identify additional network segments.
 
-EOF
-
-    if [[ $PIVOT_PERFORMED -eq 1 ]]; then
-        cat >> "$MD_FILE" <<EOF
 **Phase 4 -- Lateral Movement and Cleanup.** Recovered NTLM hashes were used in Pass-the-Hash attacks against all live hosts in the environment. Known MSSQL credentials were tested for reuse against additional MSSQL instances. When a compromised host was found to have network interfaces on previously unknown segments, the Windows netsh portproxy facility was used to establish TCP port forwarding through the dual-homed host, allowing the attacker machine to reach services on the remote network. Initial reconnaissance of each new segment was performed from the pivot host itself using PowerShell-based scanning, followed by targeted port forwarding and execution of the full attack chain through the forwarded ports. After all testing was complete, all remote artifacts were reverted: portproxy forwarding rules were reset, xp_cmdshell was disabled, scheduled tasks and payloads were removed, temporary files were deleted, and registry modifications were restored to their original values.
 
 EOF
-    else
-        cat >> "$MD_FILE" <<EOF
-**Phase 4 -- Lateral Movement and Cleanup.** Recovered NTLM hashes were used in Pass-the-Hash attacks against all live hosts in the environment. Known MSSQL credentials were tested for reuse against additional MSSQL instances. Network interfaces on compromised hosts were enumerated and additional network segments were identified but were not tested per operator decision. After all testing was complete, all remote artifacts were reverted: xp_cmdshell was disabled, scheduled tasks and payloads were removed, temporary files were deleted, and registry modifications were restored to their original values.
-
-EOF
-    fi
 
 #    ==
     # 3. ATTACK NARRATIVE
@@ -297,31 +268,14 @@ EOF
 
     # New segments narrative
     if [[ -n "$NEW_SEGMENTS" ]]; then
-        if [[ $PIVOT_PERFORMED -eq 1 ]]; then
-            cat >> "$MD_FILE" <<EOF
+        cat >> "$MD_FILE" <<EOF
 During post-exploitation network interface enumeration, the following previously unknown network segment(s) were discovered: $NEW_SEGMENTS. To reach these segments from the attacker machine, TCP port forwarding rules were established on the dual-homed pivot host using the Windows netsh portproxy facility. The compromised host was used to perform initial reconnaissance (host discovery and port scanning via PowerShell) against the new segment, after which targeted port forwarding rules were configured to relay attacker traffic through the pivot host to specific services on the remote network. The full attack chain was then executed through these forwarded ports.
 
 EOF
-        else
-            cat >> "$MD_FILE" <<EOF
-During post-exploitation network interface enumeration, the following previously unknown network segment(s) were discovered: $NEW_SEGMENTS. These segments were not tested during this engagement as they were outside the authorized scope. Their existence is noted here as it indicates potential attack paths that a real-world adversary could exploit to reach additional systems.
-
-EOF
-        fi
     fi
 
     cat >> "$MD_FILE" <<EOF
-Upon completion of all testing activities, the cleanup phase was executed. All remote artifacts were reverted across every compromised host, including the removal of scheduled tasks, payload files, temporary registry hive copies, SMB shares, and registry modifications.
-EOF
-
-    if [[ $PIVOT_PERFORMED -eq 1 ]]; then
-        cat >> "$MD_FILE" <<EOF
-Netsh portproxy forwarding rules were reset on all pivot hosts.
-EOF
-    fi
-
-    cat >> "$MD_FILE" <<EOF
-The xp_cmdshell stored procedure was disabled and advanced configuration options were re-hidden on all MSSQL instances. Local evidence files were preserved for this report.
+Upon completion of all testing activities, the cleanup phase was executed. All remote artifacts were reverted across every compromised host, including the removal of scheduled tasks, payload files, temporary registry hive copies, SMB shares, registry modifications, and netsh portproxy forwarding rules. The xp_cmdshell stored procedure was disabled and advanced configuration options were re-hidden on all MSSQL instances. Local evidence files were preserved for this report.
 
 EOF
 
@@ -576,49 +530,18 @@ The following MITRE ATT&CK techniques were demonstrated during this engagement:
 | ID | Technique | Tactic | Finding |
 |----|-----------|--------|---------|
 | T1046 | Network Service Discovery | Discovery | Recon phase |
+| T1110.001 | Brute Force: Password Guessing | Credential Access | Finding 1 |
+| T1059.001 | Command and Scripting Interpreter: PowerShell | Execution | Finding 2, 4 |
+| T1505 | Server Software Component (xp_cmdshell) | Persistence / Execution | Finding 2 |
+| T1003.002 | OS Credential Dumping: Security Account Manager | Credential Access | Finding 3 |
+| T1053.005 | Scheduled Task/Job: Scheduled Task | Persistence | Finding 4 |
+| T1550.002 | Use Alternate Authentication Material: Pass the Hash | Lateral Movement | Finding 5 |
+| T1078 | Valid Accounts | Lateral Movement | Finding 6 |
+| T1021.002 | Remote Services: SMB/Windows Admin Shares | Lateral Movement | Finding 5 |
+| T1090.001 | Proxy: Internal Proxy (netsh portproxy) | Command and Control | Pivot phase |
+| T1070 | Indicator Removal on Host | Defense Evasion | Cleanup phase |
+
 EOF
-
-    # Dynamically add rows based on what actually succeeded
-    # Finding 1: MSSQL brute-force
-    if [[ -f "$CREDS_FILE" ]] && [[ -s "$CREDS_FILE" ]]; then
-        echo "| T1110.001 | Brute Force: Password Guessing | Credential Access | Finding 1 |" >> "$MD_FILE"
-    fi
-
-    # Finding 2: xp_cmdshell
-    if [[ -d "$MSSQL_DIR" ]] && ls "$MSSQL_DIR"/*_cmdshell.txt &>/dev/null; then
-        echo "| T1059.001 | Command and Scripting Interpreter: PowerShell | Execution | Finding 2 |" >> "$MD_FILE"
-        echo "| T1505 | Server Software Component (xp_cmdshell) | Persistence / Execution | Finding 2 |" >> "$MD_FILE"
-    fi
-
-    # Finding 3: Credential dumping
-    if [[ -d "$LOOT_DIR" ]] && find "$LOOT_DIR" -name "hashes.txt" -exec grep -ql ":::" {} + &>/dev/null; then
-        echo "| T1003.002 | OS Credential Dumping: Security Account Manager | Credential Access | Finding 3 |" >> "$MD_FILE"
-    fi
-
-    # Finding 4: Persistence
-    if [[ -d "$PERSIST_DIR" ]] && ls "$PERSIST_DIR"/*_persist.txt &>/dev/null; then
-        echo "| T1053.005 | Scheduled Task/Job: Scheduled Task | Persistence | Finding 4 |" >> "$MD_FILE"
-    fi
-
-    # Finding 5: Pass-the-Hash
-    if [[ -f "$PIVOT_DIR/pth-successes.txt" ]] && [[ -s "$PIVOT_DIR/pth-successes.txt" ]]; then
-        echo "| T1550.002 | Use Alternate Authentication Material: Pass the Hash | Lateral Movement | Finding 5 |" >> "$MD_FILE"
-        echo "| T1021.002 | Remote Services: SMB/Windows Admin Shares | Lateral Movement | Finding 5 |" >> "$MD_FILE"
-    fi
-
-    # Finding 6: Credential reuse
-    if [[ -f "$PIVOT_DIR/credreuse-successes.txt" ]] && [[ -s "$PIVOT_DIR/credreuse-successes.txt" ]]; then
-        echo "| T1078 | Valid Accounts | Lateral Movement | Finding 6 |" >> "$MD_FILE"
-    fi
-
-    # Pivot phase
-    if [[ $PIVOT_PERFORMED -eq 1 ]]; then
-        echo "| T1090.001 | Proxy: Internal Proxy (netsh portproxy) | Command and Control | Pivot phase |" >> "$MD_FILE"
-    fi
-
-    # Cleanup always happens
-    echo "| T1070 | Indicator Removal on Host | Defense Evasion | Cleanup phase |" >> "$MD_FILE"
-    echo "" >> "$MD_FILE"
 
 #    ==
     # 6. APPENDIX B: HOSTS AND SERVICES
