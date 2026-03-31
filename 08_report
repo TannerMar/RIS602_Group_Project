@@ -50,9 +50,11 @@ gather_context() {
     ENV_NAME="${ENV_NAME:-Internal Network}"
 
     # Auto-detect scope from saved scope file
+    # Only the first line is the original engagement scope from 01_recon.
+    # Additional lines are network segments discovered during pivoting.
     SCOPE=""
     if [[ -f "$OUTDIR/scope.txt" ]]; then
-        SCOPE=$(cat "$OUTDIR/scope.txt" | paste -sd", " -)
+        SCOPE=$(head -1 "$OUTDIR/scope.txt")
     fi
     if [[ -z "$SCOPE" && -f "$OUTDIR/hosts/ping-sweep.gnmap" ]]; then
         SCOPE=$(head -1 "$OUTDIR/hosts/ping-sweep.gnmap" | grep -oP '(?<=nmap -n -sn )\S+' || true)
@@ -311,17 +313,7 @@ EOF
     fi
 
     cat >> "$MD_FILE" <<EOF
-Upon completion of all testing activities, the cleanup phase was executed. All remote artifacts were reverted across every compromised host, including the removal of scheduled tasks, payload files, temporary registry hive copies, SMB shares, and registry modifications.
-EOF
-
-    if [[ $PIVOT_PERFORMED -eq 1 ]]; then
-        cat >> "$MD_FILE" <<EOF
-Netsh portproxy forwarding rules were reset on all pivot hosts.
-EOF
-    fi
-
-    cat >> "$MD_FILE" <<EOF
-The xp_cmdshell stored procedure was disabled and advanced configuration options were re-hidden on all MSSQL instances. Local evidence files were preserved for this report.
+Upon completion of all testing activities, the cleanup phase was executed. All remote artifacts were reverted across every compromised host, including the removal of scheduled tasks, payload files, temporary registry hive copies, SMB shares, registry modifications, and netsh portproxy forwarding rules. The xp_cmdshell stored procedure was disabled and advanced configuration options were re-hidden on all MSSQL instances. Local evidence files were preserved for this report.
 
 EOF
 
