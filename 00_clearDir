@@ -4,10 +4,32 @@
 OUTDIR="./recon"
 
 if [[ ! -d "$OUTDIR" ]]; then
-    echo "[-] Nothing to clean up."
+    echo "[-] Nothing to clean up. No $OUTDIR directory found."
     exit 0
 fi
 
-echo "[*] Cleaning up recon directory..."
-rm -rf "$OUTDIR"
-echo "[+] Done. $OUTDIR removed."
+echo ""
+echo "  WARNING: This is NOT the post-engagement cleanup (07_cleanup)."
+echo "  This script deletes your LOCAL recon data directory."
+echo ""
+echo "  This will permanently remove:"
+echo "    - All scan results and service data"
+echo "    - All harvested credentials and hashes"
+echo "    - All pivot logs and portproxy records"
+echo "    - All persistence logs"
+echo "    - Any generated reports in this directory"
+echo ""
+echo "  Make sure you have saved any reports or evidence files"
+echo "  you need before proceeding."
+echo ""
+
+read -p "[?] Have you saved all needed files and want to wipe $OUTDIR? (yes/no): " CONFIRM
+
+if [[ "$CONFIRM" == "yes" ]]; then
+    echo "[*] Cleaning up recon directory..."
+    rm -rf "$OUTDIR"
+    echo "[+] Done. $OUTDIR removed. Ready for a fresh run."
+else
+    echo "[*] Aborted. $OUTDIR was NOT removed."
+    echo "[*] Type 'yes' (not just 'y') to confirm deletion."
+fi
