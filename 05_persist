@@ -10,7 +10,12 @@ CREDS_FILE="$OUTDIR/hosts/mssql-creds.txt"
 PERSIST_DIR="$OUTDIR/persist"
 mkdir -p "$PERSIST_DIR"
 
-LHOST=$(ip -br a | grep -v '^lo' | awk '{print $3}' | cut -d/ -f1 | head -1)
+if [[ -f "$OUTDIR/attacker-ip.txt" ]]; then
+    LHOST=$(cat "$OUTDIR/attacker-ip.txt")
+else
+    LHOST=$(ip -br a | grep -v '^lo' | awk '{print $3}' | cut -d/ -f1 | head -1)
+fi
+
 LPORT="${1:-4444}"
 
 # CONFIGURABLE TASK NAME -- Change this if your engagement requires a
