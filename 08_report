@@ -44,7 +44,7 @@ gather_context() {
     TESTER_NAME="${TESTER_NAME:-$(whoami)}"
 
     read -p "    Client / organization name [Company]: " CLIENT_NAME
-    CLIENT_NAME="${CLIENT_NAME:-Orgization Name}"
+    CLIENT_NAME="${CLIENT_NAME:-Capsulecorp}"
 
     read -p "    Target environment name [Network]: " ENV_NAME
     ENV_NAME="${ENV_NAME:-Internal Network}"
@@ -330,10 +330,43 @@ EOF
         fi
     fi
 
-    cat >> "$MD_FILE" <<EOF
-Upon completion of all testing activities, the cleanup phase was executed. All remote artifacts were reverted across every compromised host, including the removal of scheduled tasks, payload files, temporary registry hive copies, SMB shares, registry modifications, and netsh portproxy forwarding rules. The xp_cmdshell stored procedure was disabled and advanced configuration options were re-hidden on all MSSQL instances. Local evidence files were preserved for this report.
+    # Build cleanup paragraph dynamically based on what actually happened
+    CLEANUP_ACTIONS=""
+
+    # MSSQL cleanup always happens if we got creds
+    if [[ -f "$CREDS_FILE" ]] && [[ -s "$CREDS_FILE" ]]; then
+        CLEANUP_ACTIONS="the disabling of xp_cmdshell and re-hiding of advanced configuration options on all MSSQL instances"
+    fi
+
+    # Hashdump cleanup
+    if [[ -d "$LOOT_DIR" ]] && find "$LOOT_DIR" -name "hashes.txt" -exec grep -ql ":::" {} + &>/dev/null; then
+        CLEANUP_ACTIONS="${CLEANUP_ACTIONS}, the removal of temporary registry hive copies, SMB shares, and registry modifications"
+    fi
+
+    # Persistence cleanup
+    if [[ -d "$PERSIST_DIR" ]] && ls "$PERSIST_DIR"/*_persist.txt &>/dev/null; then
+        CLEANUP_ACTIONS="${CLEANUP_ACTIONS}, the removal of scheduled tasks and payload files"
+    fi
+
+    # Portproxy cleanup
+    if [[ $PIVOT_PERFORMED -eq 1 ]]; then
+        CLEANUP_ACTIONS="${CLEANUP_ACTIONS}, the reset of netsh portproxy forwarding rules on all pivot hosts"
+    fi
+
+    # Clean up leading comma if first item was empty
+    CLEANUP_ACTIONS=$(echo "$CLEANUP_ACTIONS" | sed 's/^, //')
+
+    if [[ -n "$CLEANUP_ACTIONS" ]]; then
+        cat >> "$MD_FILE" <<EOF
+Upon completion of all testing activities, the cleanup phase was executed. All remote artifacts were reverted across every compromised host, including ${CLEANUP_ACTIONS}. Local evidence files were preserved for this report.
 
 EOF
+    else
+        cat >> "$MD_FILE" <<EOF
+Upon completion of all testing activities, the cleanup phase was executed. Local evidence files were preserved for this report.
+
+EOF
+    fi
 
 #    ==
     # 4. TECHNICAL OBSERVATIONS (FINDINGS)
