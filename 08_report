@@ -560,18 +560,49 @@ The following MITRE ATT&CK techniques were demonstrated during this engagement:
 | ID | Technique | Tactic | Finding |
 |----|-----------|--------|---------|
 | T1046 | Network Service Discovery | Discovery | Recon phase |
-| T1110.001 | Brute Force: Password Guessing | Credential Access | Finding 1 |
-| T1059.001 | Command and Scripting Interpreter: PowerShell | Execution | Finding 2, 4 |
-| T1505 | Server Software Component (xp_cmdshell) | Persistence / Execution | Finding 2 |
-| T1003.002 | OS Credential Dumping: Security Account Manager | Credential Access | Finding 3 |
-| T1053.005 | Scheduled Task/Job: Scheduled Task | Persistence | Finding 4 |
-| T1550.002 | Use Alternate Authentication Material: Pass the Hash | Lateral Movement | Finding 5 |
-| T1078 | Valid Accounts | Lateral Movement | Finding 6 |
-| T1021.002 | Remote Services: SMB/Windows Admin Shares | Lateral Movement | Finding 5 |
-| T1090.001 | Proxy: Internal Proxy (netsh portproxy) | Command and Control | Pivot phase |
-| T1070 | Indicator Removal on Host | Defense Evasion | Cleanup phase |
-
 EOF
+
+    # Dynamically add rows based on what actually succeeded
+    # Finding 1: MSSQL brute-force
+    if [[ -f "$CREDS_FILE" ]] && [[ -s "$CREDS_FILE" ]]; then
+        echo "| T1110.001 | Brute Force: Password Guessing | Credential Access | Finding 1 |" >> "$MD_FILE"
+    fi
+
+    # Finding 2: xp_cmdshell
+    if [[ -d "$MSSQL_DIR" ]] && ls "$MSSQL_DIR"/*_cmdshell.txt &>/dev/null; then
+        echo "| T1059.001 | Command and Scripting Interpreter: PowerShell | Execution | Finding 2 |" >> "$MD_FILE"
+        echo "| T1505 | Server Software Component (xp_cmdshell) | Persistence / Execution | Finding 2 |" >> "$MD_FILE"
+    fi
+
+    # Finding 3: Credential dumping
+    if [[ -d "$LOOT_DIR" ]] && find "$LOOT_DIR" -name "hashes.txt" -exec grep -ql ":::" {} + &>/dev/null; then
+        echo "| T1003.002 | OS Credential Dumping: Security Account Manager | Credential Access | Finding 3 |" >> "$MD_FILE"
+    fi
+
+    # Finding 4: Persistence
+    if [[ -d "$PERSIST_DIR" ]] && ls "$PERSIST_DIR"/*_persist.txt &>/dev/null; then
+        echo "| T1053.005 | Scheduled Task/Job: Scheduled Task | Persistence | Finding 4 |" >> "$MD_FILE"
+    fi
+
+    # Finding 5: Pass-the-Hash
+    if [[ -f "$PIVOT_DIR/pth-successes.txt" ]] && [[ -s "$PIVOT_DIR/pth-successes.txt" ]]; then
+        echo "| T1550.002 | Use Alternate Authentication Material: Pass the Hash | Lateral Movement | Finding 5 |" >> "$MD_FILE"
+        echo "| T1021.002 | Remote Services: SMB/Windows Admin Shares | Lateral Movement | Finding 5 |" >> "$MD_FILE"
+    fi
+
+    # Finding 6: Credential reuse
+    if [[ -f "$PIVOT_DIR/credreuse-successes.txt" ]] && [[ -s "$PIVOT_DIR/credreuse-successes.txt" ]]; then
+        echo "| T1078 | Valid Accounts | Lateral Movement | Finding 6 |" >> "$MD_FILE"
+    fi
+
+    # Pivot phase
+    if [[ $PIVOT_PERFORMED -eq 1 ]]; then
+        echo "| T1090.001 | Proxy: Internal Proxy (netsh portproxy) | Command and Control | Pivot phase |" >> "$MD_FILE"
+    fi
+
+    # Cleanup always happens
+    echo "| T1070 | Indicator Removal on Host | Defense Evasion | Cleanup phase |" >> "$MD_FILE"
+    echo "" >> "$MD_FILE"
 
 #    ==
     # 6. APPENDIX B: HOSTS AND SERVICES
