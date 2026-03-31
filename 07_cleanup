@@ -25,7 +25,7 @@ mkdir -p "$CLEANUP_DIR"
 TASK_NAME="WindowsHealthCheck"
 
 
-PAYLOAD_PATH="c:\\windows\\temp\\healthcheck.ps1"
+PAYLOAD_PATH="C:\\Windows\\Temp\\healthcheck.ps1"
 
 echo "============================================================"
 echo "  Post-Engagement Cleanup"
@@ -187,8 +187,8 @@ if [[ -f "$CREDS_FILE" ]]; then
 
         echo "[*]   [Files] Removing payload and hive files..."
         xp_remote "del ${PAYLOAD_PATH}" >> "$CLEANUP_LOG" 2>&1
-        xp_remote "del c:\\windows\\temp\\sam" >> "$CLEANUP_LOG" 2>&1
-        xp_remote "del c:\\windows\\temp\\sys" >> "$CLEANUP_LOG" 2>&1
+        xp_remote "del C:\\Windows\\Temp\\sam" >> "$CLEANUP_LOG" 2>&1
+        xp_remote "del C:\\Windows\\Temp\\sys" >> "$CLEANUP_LOG" 2>&1
         echo "[+]   File cleanup attempted."
 
         echo "[*]   [Config] Disabling xp_cmdshell..."
@@ -322,11 +322,11 @@ if [[ -f "$CREDS_FILE" ]]; then
         # Category 3: Miscellaneous Files — Remove registry hive copies
 
         echo "[*]   [Files] Removing registry hive copies from C:\\Windows\\Temp..."
-        xp "del c:\\windows\\temp\\sam" >> "$CLEANUP_LOG" 2>&1
-        xp "del c:\\windows\\temp\\sys" >> "$CLEANUP_LOG" 2>&1
+        xp "del C:\\Windows\\Temp\\sam" >> "$CLEANUP_LOG" 2>&1
+        xp "del C:\\Windows\\Temp\\sys" >> "$CLEANUP_LOG" 2>&1
 
         # Verify removal of each file individually
-        VERIFY=$(xp "dir c:\\windows\\temp\\sam" 2>&1)
+        VERIFY=$(xp "dir C:\\Windows\\Temp\\sam" 2>&1)
         if echo "$VERIFY" | grep -qi "File Not Found\|cannot find"; then
             echo "[+]   SAM hive copy removed and verified."
         else
@@ -334,7 +334,7 @@ if [[ -f "$CREDS_FILE" ]]; then
             HOST_FAILED=1
         fi
 
-        VERIFY=$(xp "dir c:\\windows\\temp\\sys" 2>&1)
+        VERIFY=$(xp "dir C:\\Windows\\Temp\\sys" 2>&1)
         if echo "$VERIFY" | grep -qi "File Not Found\|cannot find"; then
             echo "[+]   SYSTEM hive copy removed and verified."
         else
@@ -364,7 +364,7 @@ if [[ -f "$CREDS_FILE" ]]; then
         # hive files and the c:\windows\temp directory itself. 
 
         echo "[*]   [Config] Reverting cacls permissions on C:\\Windows\\Temp..."
-        xp "cacls c:\\windows\\temp /E /R \"Anonymous Logon\"" >> "$CLEANUP_LOG" 2>&1
+        xp "cacls C:\\Windows\\Temp /E /R \"Anonymous Logon\"" >> "$CLEANUP_LOG" 2>&1
         echo "[+]   Anonymous Logon ACE removed from C:\\Windows\\Temp."
 
 
@@ -531,11 +531,11 @@ if [[ -f "$PTH_FILE" ]]; then
         # may be leftover hive copies.
 
         echo "[*]   [Files] Checking for and removing any hive copies..."
-        pth_exec "del c:\\windows\\temp\\sam" >> "$CLEANUP_LOG" 2>&1
-        pth_exec "del c:\\windows\\temp\\sys" >> "$CLEANUP_LOG" 2>&1
+        pth_exec "del C:\\Windows\\Temp\\sam" >> "$CLEANUP_LOG" 2>&1
+        pth_exec "del C:\\Windows\\Temp\\sys" >> "$CLEANUP_LOG" 2>&1
 
-        VERIFY_SAM=$(pth_exec "dir c:\\windows\\temp\\sam" 2>&1)
-        VERIFY_SYS=$(pth_exec "dir c:\\windows\\temp\\sys" 2>&1)
+        VERIFY_SAM=$(pth_exec "dir C:\\Windows\\Temp\\sam" 2>&1)
+        VERIFY_SYS=$(pth_exec "dir C:\\Windows\\Temp\\sys" 2>&1)
         if echo "$VERIFY_SAM" | grep -qi "File Not Found\|cannot find" && \
            echo "$VERIFY_SYS" | grep -qi "File Not Found\|cannot find"; then
             echo "[+]   No hive copies found (or removed successfully)."
@@ -557,7 +557,7 @@ if [[ -f "$PTH_FILE" ]]; then
 
             # Revert the associated registry and permission changes
             echo "[*]   [Config] Reverting associated cacls, registry, and LanmanServer..."
-            pth_exec "cacls c:\\windows\\temp /E /R \"Anonymous Logon\"" >> "$CLEANUP_LOG" 2>&1
+            pth_exec "cacls C:\\Windows\\Temp /E /R \"Anonymous Logon\"" >> "$CLEANUP_LOG" 2>&1
             pth_exec "reg add \"HKLM\\SYSTEM\\CurrentControlSet\\Services\\LanmanServer\\Parameters\" /v RestrictNullSessAccess /t REG_DWORD /d 1 /f" >> "$CLEANUP_LOG" 2>&1
             pth_exec "reg delete \"HKLM\\SYSTEM\\CurrentControlSet\\Services\\LanmanServer\\Parameters\" /v NullSessionShares /f" >> "$CLEANUP_LOG" 2>&1
 

@@ -37,7 +37,7 @@ MSSQL_FILE="$OUTDIR/hosts/mssql-targets.txt"
 
 # Save the scanned scope for the report generator to pick up automatically
 echo "$CIDR" > "$OUTDIR/scope.txt"
-echo "$LOST" > "$OUTDIR/attacker-ip.txt"
+echo "$LHOST" > "$OUTDIR/attacker-ip.txt"
 
 echo "[*] Starting recon on $CIDR"
 echo ""
