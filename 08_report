@@ -44,7 +44,7 @@ gather_context() {
     TESTER_NAME="${TESTER_NAME:-$(whoami)}"
 
     read -p "    Client / organization name [Company]: " CLIENT_NAME
-    CLIENT_NAME="${CLIENT_NAME:-Capsulecorp}"
+    CLIENT_NAME="${CLIENT_NAME:-Orgization Name}"
 
     read -p "    Target environment name [Network]: " ENV_NAME
     ENV_NAME="${ENV_NAME:-Internal Network}"
