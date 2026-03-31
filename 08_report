@@ -43,10 +43,10 @@ gather_context() {
     read -p "    Tester name [$(whoami)]: " TESTER_NAME
     TESTER_NAME="${TESTER_NAME:-$(whoami)}"
 
-    read -p "    Client / organization name [Capsulecorp]: " CLIENT_NAME
+    read -p "    Client / organization name [Company]: " CLIENT_NAME
     CLIENT_NAME="${CLIENT_NAME:-Capsulecorp}"
 
-    read -p "    Target environment name [Internal Network]: " ENV_NAME
+    read -p "    Target environment name [Network]: " ENV_NAME
     ENV_NAME="${ENV_NAME:-Internal Network}"
 
     # Auto-detect scope from saved scope file
@@ -86,6 +86,12 @@ gather_context() {
     NEW_SEGMENTS=""
     if [[ -f "$PIVOT_DIR/networks-discovered.txt" ]]; then
         NEW_SEGMENTS=$(cat "$PIVOT_DIR/networks-discovered.txt" | paste -sd", " -)
+    fi
+
+    # Check if pivoting was actually performed (operator may have declined)
+    PIVOT_PERFORMED=0
+    if [[ -f "$PIVOT_DIR/portproxy-rules.txt" ]] && [[ -s "$PIVOT_DIR/portproxy-rules.txt" ]]; then
+        PIVOT_PERFORMED=1
     fi
 
     # Count MSSQL targets
@@ -182,10 +188,17 @@ EOF
     fi
 
     if [[ -n "$NEW_SEGMENTS" ]]; then
-        cat >> "$MD_FILE" <<EOF
+        if [[ $PIVOT_PERFORMED -eq 1 ]]; then
+            cat >> "$MD_FILE" <<EOF
 
 During post-exploitation and lateral movement, the following additional network segment(s) were discovered: $NEW_SEGMENTS. These segments were subsequently scanned and tested as part of the recursive pivot process.
 EOF
+        else
+            cat >> "$MD_FILE" <<EOF
+
+During post-exploitation and lateral movement, the following additional network segment(s) were discovered: $NEW_SEGMENTS. These segments were identified but were not tested during this engagement per operator decision to remain within the authorized scope.
+EOF
+        fi
     fi
 
     cat >> "$MD_FILE" <<EOF
@@ -219,9 +232,19 @@ The engagement followed a four-phase methodology consistent with industry-standa
 
 **Phase 3 -- Post-Exploitation.** The SAM and SYSTEM registry hives were extracted from compromised hosts and NTLM password hashes were recovered. Persistence was established via Windows scheduled tasks configured to execute a reverse shell payload on system boot. Network interfaces on compromised hosts were enumerated to identify additional network segments.
 
+EOF
+
+    if [[ $PIVOT_PERFORMED -eq 1 ]]; then
+        cat >> "$MD_FILE" <<EOF
 **Phase 4 -- Lateral Movement and Cleanup.** Recovered NTLM hashes were used in Pass-the-Hash attacks against all live hosts in the environment. Known MSSQL credentials were tested for reuse against additional MSSQL instances. When a compromised host was found to have network interfaces on previously unknown segments, the Windows netsh portproxy facility was used to establish TCP port forwarding through the dual-homed host, allowing the attacker machine to reach services on the remote network. Initial reconnaissance of each new segment was performed from the pivot host itself using PowerShell-based scanning, followed by targeted port forwarding and execution of the full attack chain through the forwarded ports. After all testing was complete, all remote artifacts were reverted: portproxy forwarding rules were reset, xp_cmdshell was disabled, scheduled tasks and payloads were removed, temporary files were deleted, and registry modifications were restored to their original values.
 
 EOF
+    else
+        cat >> "$MD_FILE" <<EOF
+**Phase 4 -- Lateral Movement and Cleanup.** Recovered NTLM hashes were used in Pass-the-Hash attacks against all live hosts in the environment. Known MSSQL credentials were tested for reuse against additional MSSQL instances. Network interfaces on compromised hosts were enumerated and additional network segments were identified but were not tested per operator decision. After all testing was complete, all remote artifacts were reverted: xp_cmdshell was disabled, scheduled tasks and payloads were removed, temporary files were deleted, and registry modifications were restored to their original values.
+
+EOF
+    fi
 
 #    ==
     # 3. ATTACK NARRATIVE
@@ -268,10 +291,17 @@ EOF
 
     # New segments narrative
     if [[ -n "$NEW_SEGMENTS" ]]; then
-        cat >> "$MD_FILE" <<EOF
+        if [[ $PIVOT_PERFORMED -eq 1 ]]; then
+            cat >> "$MD_FILE" <<EOF
 During post-exploitation network interface enumeration, the following previously unknown network segment(s) were discovered: $NEW_SEGMENTS. To reach these segments from the attacker machine, TCP port forwarding rules were established on the dual-homed pivot host using the Windows netsh portproxy facility. The compromised host was used to perform initial reconnaissance (host discovery and port scanning via PowerShell) against the new segment, after which targeted port forwarding rules were configured to relay attacker traffic through the pivot host to specific services on the remote network. The full attack chain was then executed through these forwarded ports.
 
 EOF
+        else
+            cat >> "$MD_FILE" <<EOF
+During post-exploitation network interface enumeration, the following previously unknown network segment(s) were discovered: $NEW_SEGMENTS. These segments were not tested during this engagement as they were outside the authorized scope. Their existence is noted here as it indicates potential attack paths that a real-world adversary could exploit to reach additional systems.
+
+EOF
+        fi
     fi
 
     cat >> "$MD_FILE" <<EOF

