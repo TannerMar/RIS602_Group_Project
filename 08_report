@@ -96,7 +96,15 @@ gather_context() {
     if [[ -f "$PIVOT_DIR/pivot-decisions.txt" ]] && grep -q "^PIVOTED:" "$PIVOT_DIR/pivot-decisions.txt" 2>/dev/null; then
         PIVOT_PERFORMED=1
     fi
+
+    # Check if any remote-segment hosts were actually compromised during pivot
+    REMOTE_HOSTS_COMPROMISED=0
+    if [[ -f "$PIVOT_DIR/credreuse-successes.txt" ]] && grep -q "proxy" "$PIVOT_DIR/credreuse-successes.txt" 2>/dev/null; then
+        REMOTE_HOSTS_COMPROMISED=1
+    fi
+
     echo "    Pivot performed: $( [[ $PIVOT_PERFORMED -eq 1 ]] && echo 'YES' || echo 'NO' )"
+    echo "    Remote hosts compromised: $( [[ $REMOTE_HOSTS_COMPROMISED -eq 1 ]] && echo 'YES' || echo 'NO' )"
     if [[ -f "$PIVOT_DIR/pivot-decisions.txt" ]]; then
         echo "    Pivot decisions:"
         cat "$PIVOT_DIR/pivot-decisions.txt" | sed 's/^/        /'
@@ -196,10 +204,15 @@ EOF
     fi
 
     if [[ -n "$NEW_SEGMENTS" ]]; then
-        if [[ $PIVOT_PERFORMED -eq 1 ]]; then
+        if [[ $PIVOT_PERFORMED -eq 1 && $REMOTE_HOSTS_COMPROMISED -eq 1 ]]; then
             cat >> "$MD_FILE" <<EOF
 
 During post-exploitation and lateral movement, the following additional network segment(s) were discovered: $NEW_SEGMENTS. These segments were subsequently scanned and tested as part of the recursive pivot process.
+EOF
+        elif [[ $PIVOT_PERFORMED -eq 1 && $REMOTE_HOSTS_COMPROMISED -eq 0 ]]; then
+            cat >> "$MD_FILE" <<EOF
+
+During post-exploitation and lateral movement, the following additional network segment(s) were discovered: $NEW_SEGMENTS. These segments were scanned from the pivot host but no exploitable Windows hosts were identified on the remote network(s).
 EOF
         else
             cat >> "$MD_FILE" <<EOF
@@ -244,12 +257,12 @@ EOF
 
     if [[ $PIVOT_PERFORMED -eq 1 ]]; then
         cat >> "$MD_FILE" <<EOF
-**Phase 4 -- Lateral Movement and Cleanup.** Recovered NTLM hashes were used in Pass-the-Hash attacks against all live hosts in the environment. Known MSSQL credentials were tested for reuse against additional MSSQL instances. When a compromised host was found to have network interfaces on previously unknown segments, the Windows netsh portproxy facility was used to establish TCP port forwarding through the dual-homed host, allowing the attacker machine to reach services on the remote network. Initial reconnaissance of each new segment was performed from the pivot host itself using PowerShell-based scanning, followed by targeted port forwarding and execution of the full attack chain through the forwarded ports. After all testing was complete, all remote artifacts were reverted: portproxy forwarding rules were reset, xp_cmdshell was disabled, scheduled tasks and payloads were removed, temporary files were deleted, and registry modifications were restored to their original values.
+**Phase 4 -- Lateral Movement and Cleanup.** Recovered NTLM hashes were used in Pass-the-Hash attacks against all Windows hosts in the environment. Known MSSQL credentials were tested for reuse against additional MSSQL instances. When a compromised host was found to have network interfaces on previously unknown segments, the Windows netsh portproxy facility was used to establish TCP port forwarding through the dual-homed host, allowing the attacker machine to reach services on the remote network. Initial reconnaissance of each new segment was performed from the pivot host itself using PowerShell-based scanning, followed by targeted port forwarding and execution of the full attack chain through the forwarded ports. After all testing was complete, all remote artifacts were reverted: portproxy forwarding rules were reset, xp_cmdshell was disabled, scheduled tasks and payloads were removed, temporary files were deleted, and registry modifications were restored to their original values.
 
 EOF
     else
         cat >> "$MD_FILE" <<EOF
-**Phase 4 -- Lateral Movement and Cleanup.** Recovered NTLM hashes were used in Pass-the-Hash attacks against all live hosts in the environment. Known MSSQL credentials were tested for reuse against additional MSSQL instances. Network interfaces on compromised hosts were enumerated and additional network segments were identified but were not tested per operator decision. After all testing was complete, all remote artifacts were reverted: xp_cmdshell was disabled, scheduled tasks and payloads were removed, temporary files were deleted, and registry modifications were restored to their original values.
+**Phase 4 -- Lateral Movement and Cleanup.** Recovered NTLM hashes were used in Pass-the-Hash attacks against all Windows hosts in the environment. Known MSSQL credentials were tested for reuse against additional MSSQL instances. Network interfaces on compromised hosts were enumerated and additional network segments were identified but were not tested per operator decision. After all testing was complete, all remote artifacts were reverted: xp_cmdshell was disabled, scheduled tasks and payloads were removed, temporary files were deleted, and registry modifications were restored to their original values.
 
 EOF
     fi
@@ -261,7 +274,7 @@ EOF
 
 # Attack Narrative
 
-The engagement began with a network sweep of the scoped range ($SCOPE), which identified $LIVE_HOSTS live hosts. A full TCP port scan was performed against all discovered hosts, followed by service and version detection on every open port.
+The engagement began with a network sweep of the scoped range ($SCOPE), which identified $LIVE_HOSTS live hosts, of which $WINDOWS_HOSTS were identified as Windows systems. A full TCP port scan was performed against all discovered hosts, followed by service and version detection on every open port.
 
 Banner analysis of the service scan results identified $MSSQL_COUNT host(s) running Microsoft SQL Server. Protocol-specific target lists were compiled and each MSSQL instance was tested for default and commonly used credentials using dictionary-based brute-force authentication attempts.
 
@@ -283,7 +296,7 @@ EOF
     if [[ -f "$PIVOT_DIR/pth-successes.txt" ]] && [[ $(wc -l < "$PIVOT_DIR/pth-successes.txt") -gt 0 ]]; then
         PTH_COUNT=$(wc -l < "$PIVOT_DIR/pth-successes.txt")
         cat >> "$MD_FILE" <<EOF
-The recovered NTLM hashes were sprayed against all remaining live hosts using Pass-the-Hash (PtH) authentication. This technique was successful against $PTH_COUNT additional host(s), demonstrating that credential material was being reused across multiple systems. Each newly compromised host was subjected to the same post-exploitation process: credential dumping, network interface enumeration, and persistence establishment.
+The recovered NTLM hashes were sprayed against all remaining Windows hosts using Pass-the-Hash (PtH) authentication. This technique was successful against $PTH_COUNT additional host(s), demonstrating that credential material was being reused across multiple systems. Each newly compromised host was subjected to the same post-exploitation process: credential dumping, network interface enumeration, and persistence establishment.
 
 EOF
     fi
@@ -299,9 +312,14 @@ EOF
 
     # New segments narrative
     if [[ -n "$NEW_SEGMENTS" ]]; then
-        if [[ $PIVOT_PERFORMED -eq 1 ]]; then
+        if [[ $PIVOT_PERFORMED -eq 1 && $REMOTE_HOSTS_COMPROMISED -eq 1 ]]; then
             cat >> "$MD_FILE" <<EOF
 During post-exploitation network interface enumeration, the following previously unknown network segment(s) were discovered: $NEW_SEGMENTS. To reach these segments from the attacker machine, TCP port forwarding rules were established on the dual-homed pivot host using the Windows netsh portproxy facility. The compromised host was used to perform initial reconnaissance (host discovery and port scanning via PowerShell) against the new segment, after which targeted port forwarding rules were configured to relay attacker traffic through the pivot host to specific services on the remote network. The full attack chain was then executed through these forwarded ports.
+
+EOF
+        elif [[ $PIVOT_PERFORMED -eq 1 && $REMOTE_HOSTS_COMPROMISED -eq 0 ]]; then
+            cat >> "$MD_FILE" <<EOF
+During post-exploitation network interface enumeration, the following previously unknown network segment(s) were discovered: $NEW_SEGMENTS. The tester attempted to pivot into these segments by performing remote host discovery and port scanning via PowerShell on the dual-homed pivot host. However, no exploitable Windows hosts were identified on the remote segment(s), and no additional systems were compromised through the pivot. The existence of these segments is noted as it indicates potential lateral movement paths that should be evaluated for network segmentation controls.
 
 EOF
         else
