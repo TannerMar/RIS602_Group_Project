@@ -3,8 +3,6 @@
 # 00_runAll — Master runner for the full attack chain.
 #             Accepts an optional CIDR argument; if omitted, prompts for one.
 
-set -e
-
 CIDR="$1"
 
 if [[ -z "$CIDR" ]]; then
