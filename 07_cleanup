@@ -27,11 +27,9 @@ TASK_NAME="WindowsHealthCheck"
 
 PAYLOAD_PATH="C:\\Windows\\Temp\\healthcheck.ps1"
 
-echo "============================================================"
 echo "  Post-Engagement Cleanup"
 echo "  Chapter 11: Five Cleanup Categories"
 echo "  Started: $(date)"
-echo "============================================================"
 echo ""
 echo "[*] Local recon files will NOT be removed (needed for reporting)."
 echo ""
