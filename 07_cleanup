@@ -117,9 +117,9 @@ echo ""
 
 # The cleanup order matters for cross-network pivots:
 #   1. Clean remote-segment MSSQL hosts FIRST (while portproxy is still active)
-#   2. Reset portproxy rules on pivot hosts
-#   3. Clean same-segment MSSQL hosts (xp_cmdshell disable is the last step)
-#   4. Clean PtH hosts
+#   2. Clean PtH hosts (remote-segment PtH hosts also need portproxy alive)
+#   3. Reset portproxy rules on pivot hosts
+#   4. Clean same-segment MSSQL hosts (xp_cmdshell disable is the last step)
 
 # Build list of hosts from the original scan (same-segment, directly reachable)
 declare -A ORIGINAL_HOSTS
@@ -208,9 +208,165 @@ else
 fi
 
 
-# Now reset portproxy rules (after remote hosts are cleaned)
+# Phase 2: PtH-Compromised Hosts (before portproxy reset so remote PtH hosts are reachable)
 
-echo "  Phase 2: Port Forwarding Rules (netsh portproxy)"
+echo "  Phase 2: PtH-Compromised Hosts"
+echo ""
+
+PTH_FILE="$PIVOT_DIR/pth-successes.txt"
+if [[ -f "$PTH_FILE" ]]; then
+    while IFS=: read -r HOST PUSER NTHASH; do
+        [[ -z "$HOST" || -z "$NTHASH" ]] && continue
+        [[ "${CLEANED[$HOST]+exists}" ]] && continue
+
+        echo "------------------------------------------------------------"
+        echo "[*] PtH Host: $HOST  |  User: $PUSER"
+        echo "------------------------------------------------------------"
+
+        SAFE_HOST="${HOST//./_}"
+        CLEANUP_LOG="$CLEANUP_DIR/${SAFE_HOST}_pth_cleanup.log"
+        > "$CLEANUP_LOG"
+        HOST_FAILED=0
+
+        # Determine if this PtH host is on a remote segment (needs portproxy)
+        PTH_TARGET="$HOST"
+        PTH_PORT_FLAG=""
+        if [[ ! "${ORIGINAL_HOSTS[$HOST]+exists}" ]]; then
+            # Remote-segment host — check proxy-chain-map.txt first (written by 06_pivot)
+            CHAIN_ENTRY=$(grep "^${HOST}|" "$PIVOT_DIR/proxy-chain-map.txt" 2>/dev/null | head -1)
+            if [[ -n "$CHAIN_ENTRY" ]]; then
+                CHAIN_VAL="${CHAIN_ENTRY#*|}"
+                if [[ "$CHAIN_VAL" != "DIRECT" ]]; then
+                    PTH_TARGET="${CHAIN_VAL%%:*}"
+                    PTH_PORT="${CHAIN_VAL##*:}"
+                    PTH_PORT_FLAG="--port $PTH_PORT"
+                    echo "[*]   Remote-segment host. Routing through ${PTH_TARGET}:${PTH_PORT} (from chain map)"
+                fi
+            else
+                # Fallback: look up 445 portproxy rule
+                PROXY_LINE=$(grep "|${HOST}|445" "$PIVOT_DIR/portproxy-rules.txt" 2>/dev/null | head -1)
+                if [[ -n "$PROXY_LINE" ]]; then
+                    PTH_TARGET=$(echo "$PROXY_LINE" | cut -d'|' -f2)
+                    PTH_PORT=$(echo "$PROXY_LINE" | cut -d'|' -f3)
+                    PTH_PORT_FLAG="--port $PTH_PORT"
+                    echo "[*]   Remote-segment host. Routing through ${PTH_TARGET}:${PTH_PORT} (from portproxy rules)"
+                else
+                    echo "[-]   WARNING: Remote host $HOST has no chain map or 445 portproxy rule. Cleanup may fail."
+                fi
+            fi
+        fi
+
+        # Helper: run command via nxc PtH (proxy-aware)
+        pth_exec() {
+            local CMD="$1"
+            nxc smb "$PTH_TARGET" $PTH_PORT_FLAG -u "$PUSER" -H "$NTHASH" -x "$CMD" 2>&1
+        }
+
+
+        # Category 5: Backdoors — Remove scheduled task
+
+        echo "[*]   [Backdoor] Removing scheduled task '$TASK_NAME'..."
+        RESULT=$(pth_exec "schtasks /delete /tn ${TASK_NAME} /f" 2>&1)
+        echo "$RESULT" >> "$CLEANUP_LOG"
+
+        # Verify
+        VERIFY=$(pth_exec "schtasks /query /tn ${TASK_NAME}" 2>&1)
+        if echo "$VERIFY" | grep -qi "ERROR\|does not exist\|cannot find"; then
+            echo "[+]   Scheduled task removed and verified."
+        elif echo "$RESULT" | grep -qi "SUCCESS\|successfully"; then
+            echo "[+]   Scheduled task reported removed."
+        else
+            echo "[-]   WARNING: Could not confirm scheduled task removal."
+            HOST_FAILED=1
+        fi
+
+
+        # Category 3: Miscellaneous Files — Remove payload script
+
+        echo "[*]   [Files] Removing payload file..."
+        pth_exec "del ${PAYLOAD_PATH}" >> "$CLEANUP_LOG" 2>&1
+
+        # Verify
+        VERIFY=$(pth_exec "dir ${PAYLOAD_PATH}" 2>&1)
+        if echo "$VERIFY" | grep -qi "File Not Found\|cannot find"; then
+            echo "[+]   Payload file removed and verified."
+        else
+            echo "[-]   WARNING: Could not confirm payload file removal."
+            HOST_FAILED=1
+        fi
+
+
+        # Category 3: Miscellaneous Files — Remove registry hive copies
+        # secretsdump.py via PtH does NOT leave files on disk (it reads
+        # the hives remotely over SMB). However, if the recursive segment
+        # scanner ran the full MSSQL attack chain on this host first, there
+        # may be leftover hive copies.
+
+        echo "[*]   [Files] Checking for and removing any hive copies..."
+        pth_exec "del C:\\Windows\\Temp\\sam" >> "$CLEANUP_LOG" 2>&1
+        pth_exec "del C:\\Windows\\Temp\\sys" >> "$CLEANUP_LOG" 2>&1
+
+        VERIFY_SAM=$(pth_exec "dir C:\\Windows\\Temp\\sam" 2>&1)
+        VERIFY_SYS=$(pth_exec "dir C:\\Windows\\Temp\\sys" 2>&1)
+        if echo "$VERIFY_SAM" | grep -qi "File Not Found\|cannot find" && \
+           echo "$VERIFY_SYS" | grep -qi "File Not Found\|cannot find"; then
+            echo "[+]   No hive copies found (or removed successfully)."
+        else
+            echo "[-]   WARNING: Hive copies may still exist. Manual check needed."
+            HOST_FAILED=1
+        fi
+
+
+        # Category 4: Configuration Changes — Check for SMB share
+        # If the share exists, remove it and revert all associated changes.
+
+        echo "[*]   [Config] Checking for SMB share 'pentest'..."
+        SHARE_CHECK=$(pth_exec "net share" 2>&1)
+        if echo "$SHARE_CHECK" | grep -qi "pentest"; then
+            echo "[*]   SMB share 'pentest' found. Removing..."
+            pth_exec "net share pentest /delete" >> "$CLEANUP_LOG" 2>&1
+            echo "[+]   SMB share removed."
+
+            # Revert the associated registry and permission changes
+            echo "[*]   [Config] Reverting associated cacls, registry, and LanmanServer..."
+            pth_exec "cacls C:\\Windows\\Temp /E /R \"Anonymous Logon\"" >> "$CLEANUP_LOG" 2>&1
+            pth_exec "reg add \"HKLM\\SYSTEM\\CurrentControlSet\\Services\\LanmanServer\\Parameters\" /v RestrictNullSessAccess /t REG_DWORD /d 1 /f" >> "$CLEANUP_LOG" 2>&1
+            pth_exec "reg delete \"HKLM\\SYSTEM\\CurrentControlSet\\Services\\LanmanServer\\Parameters\" /v NullSessionShares /f" >> "$CLEANUP_LOG" 2>&1
+
+            echo "[*]   [Config] Restarting LanmanServer..."
+            pth_exec "net stop LanmanServer" >> "$CLEANUP_LOG" 2>&1
+            sleep 3
+            pth_exec "net start LanmanServer" >> "$CLEANUP_LOG" 2>&1
+            sleep 3
+            echo "[+]   LanmanServer restarted."
+        else
+            echo "[+]   No 'pentest' SMB share found on this host."
+        fi
+
+
+        # Host summary
+
+        CLEANED["$HOST"]=1
+        if [[ $HOST_FAILED -eq 0 ]]; then
+            echo "[+] CLEANUP COMPLETE for PtH host $HOST -- all actions verified."
+            TOTAL_CLEANED=$((TOTAL_CLEANED + 1))
+        else
+            echo "[!] CLEANUP COMPLETE for PtH host $HOST -- some actions need manual verification."
+            echo "[!] Review log: $CLEANUP_LOG"
+            TOTAL_FAILED=$((TOTAL_FAILED + 1))
+        fi
+        echo ""
+
+    done < "$PTH_FILE"
+else
+    echo "[-] No PtH successes file found. Skipping PtH host cleanup."
+    echo ""
+fi
+
+
+# Now reset portproxy rules (after remote hosts AND remote PtH hosts are cleaned)
+
+echo "  Phase 3: Port Forwarding Rules (netsh portproxy)"
 echo ""
 
 PORTPROXY_FILE="$PIVOT_DIR/portproxy-rules.txt"
@@ -248,9 +404,9 @@ else
 fi
 
 
-# Phase 3: Same-segment MSSQL hosts
+# Phase 4: Same-segment MSSQL hosts
 
-echo "  Phase 3: Same-Segment MSSQL Hosts"
+echo "  Phase 4: Same-Segment MSSQL Hosts"
 echo ""
 
 if [[ -f "$CREDS_FILE" ]]; then
@@ -460,134 +616,6 @@ else
     echo ""
 fi
 
-
-
-# Phase 2: PtH-Compromised Hosts
-
-echo "  Categories 3-5: PtH-Compromised Hosts"
-echo ""
-
-PTH_FILE="$PIVOT_DIR/pth-successes.txt"
-if [[ -f "$PTH_FILE" ]]; then
-    while IFS=: read -r HOST PUSER NTHASH; do
-        [[ -z "$HOST" || -z "$NTHASH" ]] && continue
-        [[ "${CLEANED[$HOST]+exists}" ]] && continue
-
-        echo "------------------------------------------------------------"
-        echo "[*] PtH Host: $HOST  |  User: $PUSER"
-        echo "------------------------------------------------------------"
-
-        SAFE_HOST="${HOST//./_}"
-        CLEANUP_LOG="$CLEANUP_DIR/${SAFE_HOST}_pth_cleanup.log"
-        > "$CLEANUP_LOG"
-        HOST_FAILED=0
-
-        # Helper: run command via nxc PtH
-        pth_exec() {
-            local CMD="$1"
-            nxc smb "$HOST" -u "$PUSER" -H "$NTHASH" -x "$CMD" 2>&1
-        }
-
-
-        # Category 5: Backdoors — Remove scheduled task
-
-        echo "[*]   [Backdoor] Removing scheduled task '$TASK_NAME'..."
-        RESULT=$(pth_exec "schtasks /delete /tn ${TASK_NAME} /f" 2>&1)
-        echo "$RESULT" >> "$CLEANUP_LOG"
-
-        # Verify
-        VERIFY=$(pth_exec "schtasks /query /tn ${TASK_NAME}" 2>&1)
-        if echo "$VERIFY" | grep -qi "ERROR\|does not exist\|cannot find"; then
-            echo "[+]   Scheduled task removed and verified."
-        elif echo "$RESULT" | grep -qi "SUCCESS\|successfully"; then
-            echo "[+]   Scheduled task reported removed."
-        else
-            echo "[-]   WARNING: Could not confirm scheduled task removal."
-            HOST_FAILED=1
-        fi
-
-
-        # Category 3: Miscellaneous Files — Remove payload script
-
-        echo "[*]   [Files] Removing payload file..."
-        pth_exec "del ${PAYLOAD_PATH}" >> "$CLEANUP_LOG" 2>&1
-
-        # Verify
-        VERIFY=$(pth_exec "dir ${PAYLOAD_PATH}" 2>&1)
-        if echo "$VERIFY" | grep -qi "File Not Found\|cannot find"; then
-            echo "[+]   Payload file removed and verified."
-        else
-            echo "[-]   WARNING: Could not confirm payload file removal."
-            HOST_FAILED=1
-        fi
-
-
-        # Category 3: Miscellaneous Files — Remove registry hive copies
-        # secretsdump.py via PtH does NOT leave files on disk (it reads
-        # the hives remotely over SMB). However, if the recursive segment
-        # scanner ran the full MSSQL attack chain on this host first, there
-        # may be leftover hive copies.
-
-        echo "[*]   [Files] Checking for and removing any hive copies..."
-        pth_exec "del C:\\Windows\\Temp\\sam" >> "$CLEANUP_LOG" 2>&1
-        pth_exec "del C:\\Windows\\Temp\\sys" >> "$CLEANUP_LOG" 2>&1
-
-        VERIFY_SAM=$(pth_exec "dir C:\\Windows\\Temp\\sam" 2>&1)
-        VERIFY_SYS=$(pth_exec "dir C:\\Windows\\Temp\\sys" 2>&1)
-        if echo "$VERIFY_SAM" | grep -qi "File Not Found\|cannot find" && \
-           echo "$VERIFY_SYS" | grep -qi "File Not Found\|cannot find"; then
-            echo "[+]   No hive copies found (or removed successfully)."
-        else
-            echo "[-]   WARNING: Hive copies may still exist. Manual check needed."
-            HOST_FAILED=1
-        fi
-
-
-        # Category 4: Configuration Changes — Check for SMB share
-        # If the share exists, remove it and revert all associated changes.
-
-        echo "[*]   [Config] Checking for SMB share 'pentest'..."
-        SHARE_CHECK=$(pth_exec "net share" 2>&1)
-        if echo "$SHARE_CHECK" | grep -qi "pentest"; then
-            echo "[*]   SMB share 'pentest' found. Removing..."
-            pth_exec "net share pentest /delete" >> "$CLEANUP_LOG" 2>&1
-            echo "[+]   SMB share removed."
-
-            # Revert the associated registry and permission changes
-            echo "[*]   [Config] Reverting associated cacls, registry, and LanmanServer..."
-            pth_exec "cacls C:\\Windows\\Temp /E /R \"Anonymous Logon\"" >> "$CLEANUP_LOG" 2>&1
-            pth_exec "reg add \"HKLM\\SYSTEM\\CurrentControlSet\\Services\\LanmanServer\\Parameters\" /v RestrictNullSessAccess /t REG_DWORD /d 1 /f" >> "$CLEANUP_LOG" 2>&1
-            pth_exec "reg delete \"HKLM\\SYSTEM\\CurrentControlSet\\Services\\LanmanServer\\Parameters\" /v NullSessionShares /f" >> "$CLEANUP_LOG" 2>&1
-
-            echo "[*]   [Config] Restarting LanmanServer..."
-            pth_exec "net stop LanmanServer" >> "$CLEANUP_LOG" 2>&1
-            sleep 3
-            pth_exec "net start LanmanServer" >> "$CLEANUP_LOG" 2>&1
-            sleep 3
-            echo "[+]   LanmanServer restarted."
-        else
-            echo "[+]   No 'pentest' SMB share found on this host."
-        fi
-
-
-        # Host summary
-
-        CLEANED["$HOST"]=1
-        if [[ $HOST_FAILED -eq 0 ]]; then
-            echo "[+] CLEANUP COMPLETE for PtH host $HOST -- all actions verified."
-            TOTAL_CLEANED=$((TOTAL_CLEANED + 1))
-        else
-            echo "[!] CLEANUP COMPLETE for PtH host $HOST -- some actions need manual verification."
-            echo "[!] Review log: $CLEANUP_LOG"
-            TOTAL_FAILED=$((TOTAL_FAILED + 1))
-        fi
-        echo ""
-
-    done < "$PTH_FILE"
-else
-    echo "[-] No PtH successes file found. Skipping PtH host cleanup."
-    echo ""
-fi
 
 
 

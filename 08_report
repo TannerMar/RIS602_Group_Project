@@ -98,8 +98,12 @@ gather_context() {
     fi
 
     # Check if any remote-segment hosts were actually compromised during pivot
+    # A remote host could be compromised via MSSQL cred reuse (credreuse-successes.txt
+    # with "proxy" in the line) OR via PtH (proxy-chain-map.txt with non-DIRECT entry)
     REMOTE_HOSTS_COMPROMISED=0
     if [[ -f "$PIVOT_DIR/credreuse-successes.txt" ]] && grep -q "proxy" "$PIVOT_DIR/credreuse-successes.txt" 2>/dev/null; then
+        REMOTE_HOSTS_COMPROMISED=1
+    elif [[ -f "$PIVOT_DIR/proxy-chain-map.txt" ]] && grep -v "|DIRECT$" "$PIVOT_DIR/proxy-chain-map.txt" 2>/dev/null | grep -q .; then
         REMOTE_HOSTS_COMPROMISED=1
     fi
 
