@@ -48,6 +48,13 @@ netexec (nxc)               # Pass-the-Hash, remote command execution via SMB (0
 /usr/share/wordlists/metasploit/common_users.txt
 /usr/share/wordlists/metasploit/common_passwords.txt
 
+# --------------------------------
+# Persistence Creation
+# --------------------------------
+# Default paths used by 05_persist, 06_pivot, 07_cleanup, and 08_report.
+# This variable can be configured at the top of each script.
+
+TASK_NAME="WindowsHealthCheck"
 
 # --------------------------------
 # Standard Unix Utilities
